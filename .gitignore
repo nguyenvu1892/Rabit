@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Data (KHÔNG ĐẨY LÊN GITHUB)
+data/*.csv
+data/*.json
+data/*.log
+data/*.png
+
+# OS
+.DS_Store
+Thumbs.db

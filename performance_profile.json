@@ -1,0 +1,26 @@
+{
+    "session_performance": [
+        {
+            "session": "NewYork",
+            "trades": 1509,
+            "avg_R": 1.3959575878064943,
+            "winrate": 0.6845593108018555
+        }
+    ],
+    "bias_performance": [
+        {
+            "h1_bias": "UNKNOWN",
+            "trades": 1509,
+            "avg_R": 1.3959575878064943,
+            "winrate": 0.6845593108018555
+        }
+    ],
+    "entry_performance": [
+        {
+            "entry_type": "BUY",
+            "trades": 1509,
+            "avg_R": 1.3959575878064943,
+            "winrate": 0.6845593108018555
+        }
+    ]
+}
