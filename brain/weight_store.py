@@ -1,128 +1,78 @@
-# brain/weight_store.py
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 
+def _key(expert: str, regime: Optional[str] = None) -> str:
+    # Backward compatible: old key is just expert name.
+    # New key supports regime-specific weights.
+    if regime is None:
+        return str(expert)
+    return f"{regime}::{expert}"
+
+
 @dataclass
-class WeightConfig:
-    # learning
-    lr: float = 0.05                 # learning rate
-    reward_win: float = 1.0
-    reward_loss: float = -1.0
-    pnl_scale: float = 0.0           # 0.0 = ignore pnl magnitude, >0 use scaled pnl
-    # safety bounds
-    w_min: float = 0.25
-    w_max: float = 3.0
-
-
 class WeightStore:
     """
-    Backward-compatible weight store.
-
-    - Old usage: get(expert_name) -> weight
-    - New usage: get(expert_name, regime) -> weight
-    - New learning: update_from_outcome(expert_name, regime, win, pnl)
+    Safe weight storage for experts (optionally per regime).
+    - Backward compatible: get(expert) still works.
+    - New: get(expert, regime) for regime-specific learning.
     """
 
-    def __init__(self, path: str = "data/weights.json", cfg: Optional[WeightConfig] = None) -> None:
-        self.path = Path(path)
-        self.cfg = cfg or WeightConfig()
-        self._w: Dict[str, float] = {}
-        self.load()
+    default_weight: float = 1.0
+    min_weight: float = 0.10
+    max_weight: float = 3.00
+    _w: Dict[str, float] = field(default_factory=dict)
 
-    def _key(self, expert_name: str, regime: Optional[str] = None) -> str:
-        # keep stable string key for json
-        r = (regime or "ANY").strip() if isinstance(regime, str) else "ANY"
-        return f"{expert_name}::{r}"
+    # ---------- basic ops ----------
+    def get(self, expert: str, regime: Optional[str] = None) -> float:
+        return float(self._w.get(_key(expert, regime), self.default_weight))
 
-    def get(self, expert_name: str, regime: Optional[str] = None, default: float = 1.0) -> float:
-        """
-        Compatible:
-          get("TREND_MA") -> reads TREND_MA::ANY if exists else fallback to old TREND_MA
-          get("TREND_MA", "RANGE") -> reads TREND_MA::RANGE else fallback ANY
-        """
-        # new key
-        k = self._key(expert_name, regime)
-        if k in self._w:
-            return float(self._w[k])
+    def set(self, expert: str, weight: float, regime: Optional[str] = None) -> None:
+        w = float(weight)
+        w = max(self.min_weight, min(self.max_weight, w))
+        self._w[_key(expert, regime)] = w
 
-        # fallback to ANY regime
-        k_any = self._key(expert_name, "ANY")
-        if k_any in self._w:
-            return float(self._w[k_any])
+    def update(self, expert: str, delta: float, regime: Optional[str] = None) -> float:
+        cur = self.get(expert, regime)
+        nxt = cur + float(delta)
+        self.set(expert, nxt, regime)
+        return self.get(expert, regime)
 
-        # legacy fallback: some older versions stored directly by expert_name
-        if expert_name in self._w:
-            return float(self._w[expert_name])
+    def multiply(self, expert: str, factor: float, regime: Optional[str] = None) -> float:
+        cur = self.get(expert, regime)
+        nxt = cur * float(factor)
+        self.set(expert, nxt, regime)
+        return self.get(expert, regime)
 
-        return float(default)
-
-    def set(self, expert_name: str, value: float, regime: Optional[str] = None) -> None:
-        v = float(value)
-        v = max(self.cfg.w_min, min(self.cfg.w_max, v))
-        self._w[self._key(expert_name, regime)] = v
-
-    def update_from_outcome(
-        self,
-        expert_name: str,
-        regime: Optional[str],
-        win: bool,
-        pnl: float = 0.0,
-    ) -> float:
-        """
-        Update rule (safe):
-          w <- clip( w + lr * (reward + pnl_scale * tanh(pnl)) )
-        """
-        base = self.get(expert_name, regime, default=1.0)
-
-        reward = self.cfg.reward_win if bool(win) else self.cfg.reward_loss
-
-        # optional pnl shaping
-        shaped = 0.0
-        if self.cfg.pnl_scale and pnl is not None:
-            try:
-                # smooth clamp with tanh-like behavior (no import math needed)
-                x = float(pnl)
-                # cheap stable squashing:
-                shaped = x / (1.0 + abs(x))
-            except Exception:
-                shaped = 0.0
-
-        delta = self.cfg.lr * (reward + self.cfg.pnl_scale * shaped)
-        new_w = base + delta
-        new_w = max(self.cfg.w_min, min(self.cfg.w_max, new_w))
-
-        self._w[self._key(expert_name, regime)] = float(new_w)
-        return float(new_w)
-
-    # ---- persistence ----
-    def load(self) -> None:
-        try:
-            if self.path.exists():
-                obj = json.loads(self.path.read_text(encoding="utf-8"))
-                if isinstance(obj, dict):
-                    # keep only numeric weights
-                    cleaned: Dict[str, float] = {}
-                    for k, v in obj.items():
-                        try:
-                            cleaned[str(k)] = float(v)
-                        except Exception:
-                            continue
-                    self._w = cleaned
-        except Exception:
-            # never crash the bot on weight file issues
-            self._w = {}
-
-    def save(self) -> None:
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._w, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-
-    def to_dict(self) -> Dict[str, float]:
+    def items(self) -> Dict[str, float]:
         return dict(self._w)
+
+    # ---------- persistence ----------
+    def save(self, path: str | Path) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "default_weight": self.default_weight,
+            "min_weight": self.min_weight,
+            "max_weight": self.max_weight,
+            "weights": self._w,
+        }
+        p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "WeightStore":
+        p = Path(path)
+        if not p.exists():
+            return cls()
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        ws = cls(
+            default_weight=float(payload.get("default_weight", 1.0)),
+            min_weight=float(payload.get("min_weight", 0.10)),
+            max_weight=float(payload.get("max_weight", 3.00)),
+        )
+        ws._w = {str(k): float(v) for k, v in dict(payload.get("weights", {})).items()}
+        return ws

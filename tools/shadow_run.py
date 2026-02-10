@@ -5,17 +5,14 @@ import random
 
 from sim.candle_loader import load_candles_csv
 from sim.shadow_runner import ShadowRunner
+
 from brain.decision_engine import DecisionEngine
 from brain.journal import Journal
-from observer.outcome_updater import OutcomeUpdater
 from brain.reinforcement_learner import ReinforcementLearner
-from brain.risk_engine import RiskEngine
 from brain.weight_store import WeightStore
 from observer.outcome_updater import OutcomeUpdater
 
-weight_store = WeightStore("data/weights.json")
 
-outcome_updater = OutcomeUpdater(learner, weight_store=weight_store)
 def _import_risk_engine():
     # Project structure moved a few times; support both.
     try:
@@ -26,7 +23,6 @@ def _import_risk_engine():
             from brain.risk_engine import RiskEngine  # type: ignore
             return RiskEngine
         except Exception:
-            # Last resort: file might be at top-level risk_engine.py
             from risk_engine import RiskEngine  # type: ignore
             return RiskEngine
 
@@ -44,23 +40,32 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--journal", type=str, default=None, help="path to journal jsonl (append)")
 
+    # 5.0.8.1: weight learning persistence
+    ap.add_argument("--weights", type=str, default="data/weights.json", help="path to weights json")
+
     args = ap.parse_args()
 
     random.seed(args.seed)
 
     candles = load_candles_csv(args.csv, limit=args.limit)
-
     journal = Journal(args.journal) if args.journal else None
 
+    # Learner + weight store only matter in train mode
     learner = ReinforcementLearner() if args.train else None
-    outcome_updater = OutcomeUpdater(learner) if args.train else None
+    weight_store = WeightStore(args.weights)
+
+    outcome_updater = OutcomeUpdater(
+        learner=learner,
+        weight_store=weight_store,
+    ) if args.train else None
+
     RiskEngineCls = _import_risk_engine()
     risk_engine = RiskEngineCls()
-
 
     # IMPORTANT: epsilon belongs to ShadowRunner exploration (not DecisionEngine constructor).
     de = DecisionEngine(
         risk_engine=risk_engine,
+        weight_store=weight_store,
     )
 
     runner = ShadowRunner(
@@ -81,8 +86,6 @@ def main():
         epsilon_cooldown=args.epsilon_cooldown,
         journal=journal,
     )
-
-
 
     print("=== SHADOW RUN DONE ===")
     for k, v in stats.to_dict().items():
