@@ -1,145 +1,131 @@
-# observer/outcome_updater.py
 from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
-from brain.weight_store import WeightStore
+
+
+@dataclass
+class OutcomeEvent:
+    """A normalized outcome event passed from ShadowRunner."""
+    entry_step: int
+    exit_step: int
+    pnl: float
+    win: bool
+    meta: Dict[str, Any]
+
 
 class OutcomeUpdater:
     """
-    - process_outcome(snapshot, outcome) or process_outcome(outcome)
-    - calls learner.update/learner.learn with (snapshot, outcome, reward)
+    5.0.8.1
+    - Update weights (expert/regime) based on trade outcomes.
+    - Keep backward compatible: learner can be None, weight_store can be None.
     """
-    def __init__(self, learner=None, trade_memory=None, weight_store: WeightStore | None = None):
+
+    def __init__(self, learner: Any = None, weight_store: Any = None) -> None:
         self.learner = learner
-        self.trade_memory = trade_memory
-        self.weight_store = weight_store or WeightStore()
-    
-    def _extract_expert_regime(self, outcome: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-        # try multiple layouts (robust)
-        # 1) direct
-        expert = outcome.get("expert")
-        regime = outcome.get("regime")
+        self.weight_store = weight_store
 
-        # 2) nested risk config (DecisionEngine return)
-        if (expert is None) or (regime is None):
-            risk = outcome.get("risk_cfg") or outcome.get("risk") or {}
-            if isinstance(risk, dict):
-                expert = expert or risk.get("expert")
-                regime = regime or risk.get("regime")
+        # Safe default hyperparams (conservative)
+        self.lr = 0.05          # learning rate
+        self.pnl_clip = 3.0     # clip pnl impact (in "R-like" units; we use sign+small magnitude)
+        self.reward_win = 1.0
+        self.reward_loss = -1.0
 
-        # 3) snapshot payload (common in journals)
-        if (expert is None) or (regime is None):
-            snap = outcome.get("snapshot") or outcome.get("payload") or {}
-            if isinstance(snap, dict):
-                risk2 = snap.get("risk_cfg") or snap.get("risk") or {}
-                if isinstance(risk2, dict):
-                    expert = expert or risk2.get("expert")
-                    regime = regime or risk2.get("regime")
-                expert = expert or snap.get("expert")
-                regime = regime or snap.get("regime")
+    def on_outcome(self, payload: Dict[str, Any]) -> None:
+        """
+        payload is typically what Journal logs for an outcome/trade.
+        We normalize then update learner + weight_store.
+        """
+        ev = self._normalize(payload)
 
-        if isinstance(expert, str):
-            expert = expert.strip() or None
-        if isinstance(regime, str):
-            regime = regime.strip() or None
+        # 1) Update RL learner (if present) - keep as-is
+        if self.learner is not None:
+            try:
+                # If your learner has a known API, keep it. Otherwise ignore safely.
+                fn = getattr(self.learner, "on_outcome", None)
+                if callable(fn):
+                    fn(payload)
+            except Exception:
+                pass
+
+        # 2) Update weights (core 5.0.8.1)
+        self._update_weights(ev)
+
+    # --------------------------
+    # internals
+    # --------------------------
+    def _normalize(self, payload: Dict[str, Any]) -> OutcomeEvent:
+        entry_step = int(payload.get("entry_step", payload.get("step", 0)))
+        exit_step = int(payload.get("exit_step", entry_step))
+        pnl = float(payload.get("pnl", 0.0))
+        win = bool(payload.get("win", pnl > 0))
+
+        meta: Dict[str, Any] = {}
+        # payload may contain risk/meta nested differently depending on your pipeline
+        if isinstance(payload.get("meta"), dict):
+            meta.update(payload["meta"])
+        if isinstance(payload.get("risk"), dict):
+            # risk often carries expert/regime
+            meta.setdefault("risk", payload["risk"])
+
+        return OutcomeEvent(
+            entry_step=entry_step,
+            exit_step=exit_step,
+            pnl=pnl,
+            win=win,
+            meta=meta,
+        )
+
+    def _extract_expert_regime(self, ev: OutcomeEvent) -> tuple[str, str]:
+        expert = "UNKNOWN_EXPERT"
+        regime = "UNKNOWN"
+
+        # Prefer explicit meta keys
+        if "expert" in ev.meta:
+            expert = str(ev.meta.get("expert") or expert)
+        if "regime" in ev.meta:
+            regime = str(ev.meta.get("regime") or regime)
+
+        # Fallback: risk dict
+        risk = ev.meta.get("risk")
+        if isinstance(risk, dict):
+            expert = str(risk.get("expert") or expert)
+            regime = str(risk.get("regime") or regime)
 
         return expert, regime
 
-    def on_outcome(self, outcome: Dict[str, Any]) -> None:
-        """
-        Expected minimal:
-          outcome["win"] bool
-          outcome["pnl"] float (optional)
-          and expert/regime (direct or nested)
-        """
-        if not isinstance(outcome, dict):
+    def _reward(self, ev: OutcomeEvent) -> float:
+        # Base reward by win/loss
+        r = self.reward_win if ev.win else self.reward_loss
+
+        # Add SMALL pnl influence but clipped (avoid exploding weights)
+        pnl = max(-self.pnl_clip, min(self.pnl_clip, ev.pnl))
+        # Normalize pnl contribution to [-0.5..0.5] roughly
+        pnl_part = 0.5 * (pnl / self.pnl_clip) if self.pnl_clip > 0 else 0.0
+
+        return float(r + pnl_part)
+
+    def _update_weights(self, ev: OutcomeEvent) -> None:
+        if self.weight_store is None:
             return
 
-        # 1) RL learner update (existing)
-        if self.learner is not None:
-            try:
-                self.learner.on_outcome(outcome)
-            except Exception:
-                pass
+        expert, regime = self._extract_expert_regime(ev)
+        reward = self._reward(ev)
 
-        # 2) Weight learning (5.0.8.1)
-        if self.weight_store is not None:
-            try:
-                win = bool(outcome.get("win", False))
-                pnl = float(outcome.get("pnl", 0.0) or 0.0)
-
-                expert, regime = self._extract_expert_regime(outcome)
-                if expert:
-                    self.weight_store.update_from_outcome(expert, regime, win=win, pnl=pnl)
-                    self.weight_store.save()
-            except Exception:
-                # never crash runner
-                pass
-
-    def _reward(self, outcome: Dict[str, Any]) -> float:
-        # normalize reward: +1 win, -1 loss; fallback pnl sign
-        if "win" in outcome:
-            return 1.0 if bool(outcome["win"]) else -1.0
-        pnl = outcome.get("pnl")
-        if pnl is None:
-            return 0.0
-        pnl = float(pnl)
-        if pnl > 0:
-            return 1.0
-        if pnl < 0:
-            return -1.0
-        return 0.0
-
-    def process_outcome(self, *args):
-        if len(args) == 1:
-            snapshot = {}
-            outcome = args[0] or {}
-        elif len(args) == 2:
-            snapshot, outcome = args
-            snapshot = snapshot or {}
-            outcome = outcome or {}
-        else:
-            raise TypeError("process_outcome expects (outcome) or (snapshot, outcome)")
-
-        reward = self._reward(outcome)
-
-        # record memory (optional)
-        if self.trade_memory is not None:
-            try:
-                self.trade_memory.record(snapshot, outcome)
-            except Exception:
-                pass
-        # --- 5.0.7.9: update weight store from outcome ---
         try:
-            expert = str((snapshot.get("risk_cfg") or {}).get("expert") or (snapshot.get("meta") or {}).get("expert") or "UNKNOWN_EXPERT")
-            regime = str((snapshot.get("risk_cfg") or {}).get("regime") or (snapshot.get("meta") or {}).get("regime") or "UNKNOWN")
+            # WeightStore.update(expert, regime, reward, lr=?)
+            upd = getattr(self.weight_store, "update", None)
+            if callable(upd):
+                try:
+                    upd(expert, regime, reward, lr=self.lr)
+                except TypeError:
+                    # Backward compat: old signature update(expert, reward, lr=?)
+                    upd(expert, reward, lr=self.lr)
 
-            # reward: đơn giản, an toàn, không pnl-scale mạnh
-            win = bool(outcome.get("win", False))
-            reward = 1.0 if win else -1.0
-
-            # nếu forced thì giảm ảnh hưởng (tránh học bậy)
-            forced = bool((snapshot.get("meta") or {}).get("forced", False))
-            if forced:
-                reward *= 0.25
-
-            self.weight_store.update(expert, regime, reward)
-
-            # attach for logging/debug (optional)
-            outcome.setdefault("meta", {})
-            outcome["meta"].update({
-                "learn_expert": expert,
-                "learn_regime": regime,
-                "reward": reward,
-                "new_weight": float(self.weight_store.get(expert, regime)),
-            })
+            # Persist
+            save = getattr(self.weight_store, "save", None)
+            if callable(save):
+                save()
         except Exception:
+            # Never break sim loop
             pass
-                    
-        # learner update (optional)
-        if self.learner is not None:
-            if hasattr(self.learner, "update"):
-                self.learner.update(snapshot, outcome, reward)
-            elif hasattr(self.learner, "learn"):
-                self.learner.learn(snapshot, outcome, reward)
-
-        return reward
