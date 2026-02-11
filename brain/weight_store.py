@@ -97,7 +97,7 @@ class WeightStore:
     # ------------------------
     # Persistence
     # ------------------------
-    def load(self, path: Optional[str] = None) -> None:
+    def load(self, data: dict) -> None:
         p = path or self.path
         if not p:
             return
@@ -287,8 +287,13 @@ class WeightStore:
         print("")
 
     def load_json(self, path: str) -> bool:
-        # backward-compat for older callers (tools/shadow_run.py, etc.)
-        return self.load(path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.load(data)
+            return True
+        except Exception:
+            return False
 
     def save_json(self, path: str) -> bool:
         # backward-compat
