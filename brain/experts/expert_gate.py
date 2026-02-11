@@ -52,18 +52,10 @@ class ExpertGate:
         return self.rng.random() < self.epsilon
 
     def pick(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> Tuple[ExpertDecision, List[ExpertDecision]]:
-        experts = []
-        try:
-            experts = list(self.registry.get_all())
-        except Exception:
-            experts = []
+        experts = self._iter_experts()
 
         if not experts:
-            return (
-                ExpertDecision(expert="NO_EXPERTS", score=0.0, allow=False, meta={"reason": "empty_registry"}),
-                [],
-            )
-
+            return self._fallback_decision_no_expert(trade_features, context)
         decisions: List[ExpertDecision] = []
         for exp in experts:
             try:
@@ -146,5 +138,26 @@ class ExpertGate:
 
                 self._cooldown_left = int(self.epsilon_cooldown)
                 return pick2, decisions
+
+        def _iter_experts(self):
+            if self.registry is None:
+                return []
+            for name in ("get_all", "all", "list_all"):
+                fn = getattr(self.registry, name, None)
+                if callable(fn):
+                    try:
+                        xs = fn()
+                        return list(xs) if xs is not None else []
+                    except Exception:
+                        pass
+
+            for attr in ("experts", "_experts"):
+                d = getattr(self.registry, attr, None)
+                if isinstance(d, dict):
+                    return list(d.values())
+                if isinstance(d, list):
+                    return d
+
+            return []
 
         return best, decisions

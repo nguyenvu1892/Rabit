@@ -30,8 +30,18 @@ class ExpertRegistry:
         return list(self._experts.values())
 
     # ✅ compatibility: ExpertGate expects get_all()
-    def get_all(self) -> List[ExpertBase]:
-        return self.all()
+    def get_all(self):
+        """
+        Backward/forward compatible: return list of all expert instances.
+        """
+        if hasattr(self, "experts") and isinstance(self.experts, dict):
+            return list(self.experts.values())
+        if hasattr(self, "_experts") and isinstance(self._experts, dict):
+            return list(self._experts.values())
+        if hasattr(self, "items") and callable(getattr(self, "items")):
+            # in case registry behaves like dict
+            return [v for _, v in self.items()]
+        return []
 
     def names(self) -> List[str]:
         return list(self._experts.keys())

@@ -141,3 +141,5 @@ class OutcomeUpdater:
             return 1.0 if win else -1.0
 
         return 0.0
+    print("DEBUG bucket:", bucket_key)
+    print("DEBUG weight before:", weight_store.get(bucket, key))
