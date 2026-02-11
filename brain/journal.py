@@ -3,29 +3,30 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+
+@dataclass
+class JournalEvent:
+    type: str
+    payload: Dict[str, Any]
 
 
 class Journal:
-    def __init__(self, path: str):
+    def __init__(self, path: Optional[str] = None) -> None:
         self.path = path
-        folder = os.path.dirname(path)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
 
-    def _write(self, obj: dict):
-        obj["ts_iso"] = datetime.utcnow().isoformat()
+    def append(self, event: JournalEvent) -> None:
+        if not self.path:
+            return
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(obj) + "\n")
+            f.write(json.dumps({"type": event.type, **event.payload}, ensure_ascii=False) + "\n")
 
-    def log_decision(self, data: dict):
-        data["type"] = "decision"
-        self._write(data)
+    # backward compatible helpers
+    def log_decision(self, payload: Dict[str, Any]) -> None:
+        self.append(JournalEvent(type="decision", payload=dict(payload)))
 
-    def log_outcome(self, data: dict):
-        data["type"] = "outcome"
-        self._write(data)
-
-    def log_heartbeat(self, data: dict):
-        data["type"] = "heartbeat"
-        self._write(data)
+    def log_outcome(self, payload: Dict[str, Any]) -> None:
+        self.append(JournalEvent(type="outcome", payload=dict(payload)))

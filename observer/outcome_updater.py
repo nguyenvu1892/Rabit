@@ -1,13 +1,12 @@
 # observer/outcome_updater.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from brain.reinforcement_learner import ReinforcementLearner
 from brain.trade_memory import TradeMemory
 
 try:
-    # optional dependency for 5.0.8.1
     from brain.weight_store import WeightStore
 except Exception:  # pragma: no cover
     WeightStore = None  # type: ignore
@@ -16,10 +15,9 @@ except Exception:  # pragma: no cover
 class OutcomeUpdater:
     """
     Consumes trade outcomes and updates:
-      - ReinforcementLearner (existing behavior)
-      - WeightStore (new, optional)  [5.0.8.1]
-
-    This is intentionally defensive: if fields are missing, it won't crash.
+    - ReinforcementLearner (existing behavior)
+    - WeightStore (new optional) [5.0.8.1]
+    Defensive: missing fields won't crash.
     """
 
     def __init__(
@@ -29,7 +27,7 @@ class OutcomeUpdater:
         weight_store: Optional["WeightStore"] = None,
         weights_path: Optional[str] = None,
         autosave: bool = True,
-    ):
+    ) -> None:
         self.learner = learner
         self.trade_memory = trade_memory
 
@@ -37,7 +35,7 @@ class OutcomeUpdater:
         self.weights_path = weights_path
         self.autosave = bool(autosave)
 
-        # If weight_store is provided and path exists, load once.
+        # Load once if configured
         if self.weight_store is not None and self.weights_path:
             try:
                 self.weight_store.path = self.weights_path
@@ -45,61 +43,50 @@ class OutcomeUpdater:
             except Exception:
                 pass
 
-    def _extract_expert_regime(self, outcome: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-        # Try common locations
+    def _extract_expert_regime(self, outcome: Dict[str, Any]) -> Tuple[str, str]:
+        # direct
         expert = outcome.get("expert")
         regime = outcome.get("regime")
 
-        # Sometimes it is inside "risk" or "meta"
+        # nested in risk/meta
         if not expert:
             risk = outcome.get("risk") or {}
             if isinstance(risk, dict):
-                expert = expert or risk.get("expert")
-                regime = regime or risk.get("regime")
+                expert = risk.get("expert") or expert
+                regime = risk.get("regime") or regime
 
         if not expert:
             meta = outcome.get("meta") or {}
             if isinstance(meta, dict):
-                expert = expert or meta.get("expert")
-                regime = regime or meta.get("regime")
+                expert = meta.get("expert") or expert
+                regime = meta.get("regime") or regime
 
-        if expert is not None:
-            expert = str(expert)
-        if regime is not None:
-            regime = str(regime)
-
-        return expert, regime
+        return str(expert or "UNKNOWN_EXPERT"), str(regime or "UNKNOWN")
 
     def process_outcome(self, outcome: Dict[str, Any]) -> None:
-        """
-        outcome is expected to have at least:
-          - "pnl" (float) and/or "win" (bool)
-        but we handle missing fields.
-        """
-        # Existing learning behavior
+        # 1) old behavior
         try:
             self.learner.learn_from_outcome(outcome)
         except Exception:
             pass
 
-       # observer/outcome_updater.py (trong đoạn xử lý outcome)
+        # 2) new weight learning
         if self.weight_store is not None:
             try:
-                expert = (payload.get("expert") or payload.get("risk", {}).get("expert") or "UNKNOWN_EXPERT")
-                regime = (payload.get("regime") or payload.get("risk", {}).get("regime") or "UNKNOWN")
+                expert, regime = self._extract_expert_regime(outcome)
 
-                win = bool(payload.get("win", False))
-                pnl = float(payload.get("pnl", 0.0))
+                win = bool(outcome.get("win", False))
+                pnl = float(outcome.get("pnl", 0.0))
 
                 r = self.weight_store.outcome_reward(win=win, pnl=pnl)
 
-                # 1) update theo expert
-                self.weight_store.update("expert", str(expert), r)
+                # Update expert weight (main)
+                self.weight_store.update("expert", expert, r)
 
-                # 2) optional: update theo regime (nhẹ hơn, có thể giảm reward)
-                self.weight_store.update("regime", str(regime), 0.3 * r)
+                # Update regime weight (lighter)
+                self.weight_store.update("regime", regime, 0.3 * r)
 
-                # periodic save
-                self.weight_store.save()
+                if self.autosave:
+                    self.weight_store.save_json(self.weights_path or self.weight_store.path)
             except Exception:
                 pass
