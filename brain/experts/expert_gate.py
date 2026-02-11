@@ -17,14 +17,24 @@ class ExpertGate:
     Supports:
     - epsilon exploration (safe)
     - cooldown for exploration
-    - optional weight_store to boost/penalize experts
+    - optional weight_store (WeightStore) to boost/penalize experts/regimes
+
+    NOTE:
+    - WeightStore in this project uses: get(bucket, key, default=1.0)
+      where bucket usually: "expert", "regime", ...
     """
+
     registry: ExpertRegistry
     epsilon: float = 0.0
     epsilon_cooldown: int = 0
     rng: Optional[random.Random] = None
-    weight_store: Optional[Any] = None  # expects .get(expert, regime=None) but handled safely
-    soft_threshold: float = 1.0001
+
+    # expects WeightStore-like:
+    # - get(bucket, key, default=1.0)
+    # - (optional) get_expert(...) in older versions (we support via try/except)
+    weight_store: Optional[Any] = None
+
+    soft_threshold: float = 1.0001  # if best adjusted score < this => allow soft explore occasionally
 
     def __post_init__(self) -> None:
         self._rng = self.rng or random.Random()
@@ -49,22 +59,61 @@ class ExpertGate:
         # alias (prevents AttributeError from older code paths)
         return self._should_explore()
 
+    def _weight_multiplier(self, expert: str, regime: Optional[str]) -> float:
+        """
+        Returns multiplicative weight:
+        - expert weight from bucket="expert"
+        - optional regime weight from bucket="regime"
+        """
+        if self.weight_store is None:
+            return 1.0
+
+        w_exp = 1.0
+        w_reg = 1.0
+
+        # Preferred path: WeightStore.get(bucket, key, default)
+        try:
+            w_exp = float(self.weight_store.get("expert", expert, 1.0))
+        except TypeError:
+            # Back-compat if someone had WeightStore.get(expert)
+            try:
+                w_exp = float(self.weight_store.get(expert))  # type: ignore[misc]
+            except Exception:
+                w_exp = 1.0
+        except Exception:
+            w_exp = 1.0
+
+        if regime:
+            try:
+                w_reg = float(self.weight_store.get("regime", str(regime), 1.0))
+            except Exception:
+                w_reg = 1.0
+
+        return w_exp * w_reg
+
     def _apply_weight(self, decision: ExpertDecision, regime: Optional[str]) -> float:
         base = float(getattr(decision, "score", 0.0))
-        if self.weight_store is None:
-            return base
-
         expert = str(getattr(decision, "expert", "UNKNOWN_EXPERT"))
-        try:
-            # WeightStore in our project now supports optional regime
-            w = float(self.weight_store.get(expert, regime))
-        except TypeError:
-            # backward compatibility: old WeightStore.get(expert)
-            w = float(self.weight_store.get(expert))
-        except Exception:
-            w = 1.0
+        return base * self._weight_multiplier(expert, regime)
 
-        return base * w
+    def _force(self, candidate: ExpertDecision, regime: Optional[str], reason: str) -> ExpertDecision:
+        forced_score = float(min(self._apply_weight(candidate, regime), 0.55))
+        meta = dict(getattr(candidate, "meta", {}) or {})
+        meta.update(
+            {
+                "forced": True,
+                "forced_reason": reason,
+                "epsilon": float(self.epsilon),
+                "cooldown": int(self.epsilon_cooldown),
+            }
+        )
+        self._cooldown_left = int(self.epsilon_cooldown)
+        return ExpertDecision(
+            True,
+            forced_score,
+            str(getattr(candidate, "expert", "UNKNOWN_EXPERT")),
+            meta,
+        )
 
     def pick(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> Tuple[ExpertDecision, List[ExpertDecision]]:
         experts = self.registry.all()
@@ -80,44 +129,32 @@ class ExpertGate:
                 d = ExpertDecision(False, 0.0, getattr(ex, "name", "UNKNOWN_EXPERT"), {"error": repr(e)})
             decisions.append(d)
 
-        regime = None
+        regime: Optional[str] = None
         try:
-            regime = str(context.get("regime")) if isinstance(context, dict) else None
+            if isinstance(context, dict):
+                regime = str(context.get("regime")) if context.get("regime") is not None else None
         except Exception:
             regime = None
 
-        # choose best among allow=True
         allow_decisions = [d for d in decisions if bool(getattr(d, "allow", False))]
+
+        # --- Normal pick ---
         if allow_decisions:
             best = max(allow_decisions, key=lambda d: self._apply_weight(d, regime))
-
-            # SOFT explore: if best score weak, allow a forced “near miss” occasionally
             best_adj = self._apply_weight(best, regime)
+
+            # SOFT explore if best is weak
             if best_adj < self.soft_threshold and self._should_explore():
                 candidate = max(decisions, key=lambda d: self._apply_weight(d, regime))
-                forced = ExpertDecision(
-                    True,
-                    float(min(self._apply_weight(candidate, regime), 0.55)),
-                    str(getattr(candidate, "expert", "UNKNOWN_EXPERT")),
-                    {**(getattr(candidate, "meta", {}) or {}), "forced": True, "forced_reason": "soft_exploration"},
-                )
-                self._cooldown_left = int(self.epsilon_cooldown)
-                return forced, decisions
+                return self._force(candidate, regime, reason="soft_exploration"), decisions
 
             return best, decisions
 
-        # HARD explore: all deny
+        # --- HARD explore if all deny ---
         if self._should_explore():
             candidate = max(decisions, key=lambda d: self._apply_weight(d, regime))
-            forced = ExpertDecision(
-                True,
-                float(min(self._apply_weight(candidate, regime), 0.55)),
-                str(getattr(candidate, "expert", "UNKNOWN_EXPERT")),
-                {**(getattr(candidate, "meta", {}) or {}), "forced": True, "forced_reason": "safe_exploration_kickstart"},
-            )
-            self._cooldown_left = int(self.epsilon_cooldown)
-            return forced, decisions
+            return self._force(candidate, regime, reason="safe_exploration_kickstart"), decisions
 
-        # default deny
+        # default deny: still return "best" for logging
         best = max(decisions, key=lambda d: self._apply_weight(d, regime))
         return best, decisions
