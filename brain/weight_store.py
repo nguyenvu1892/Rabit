@@ -52,7 +52,7 @@ class WeightStore:
       "bucketB": {"keyX": 1.20}
     }
     """
-
+    @property
     def __init__(
         self,
         path: Optional[str] = None,
@@ -297,15 +297,30 @@ class WeightStore:
         for b, kk, v in bottom:
             print(f"    {b} / {kk} = {v:.4f}")
         print("")
+    def weights(self) -> Dict[str, Dict[str, float]]:
+        # Backward/compat: expose internal map
+        return self._w
 
+    def to_dict(self) -> dict:
+        """Export weights as a plain nested dict for logging/debug/report."""
+        out: dict = {}
+        for bucket, mp in self._w.items():
+            out[str(bucket)] = {str(k): float(v) for k, v in mp.items()}
+        return out
+      # alias để tương thích nếu chỗ khác dùng tên khác
+    as_dict = to_dict
+            
     def load_json(self, path: str) -> bool:
+        # backward-compat helper
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.load(data)
+            self.load(path)
             return True
         except Exception:
             return False
     def save_json(self, path: str) -> bool:
-        # backward-compat
-        return self.save(path)
+        # backward-compat helper
+        try:
+            self.save(path)
+            return True
+        except Exception:
+            return False
