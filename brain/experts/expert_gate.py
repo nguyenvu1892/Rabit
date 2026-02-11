@@ -31,7 +31,6 @@ class ExpertGate:
         self.soft_threshold = 1.0001
         self.weight_store = weight_store
 
-    # --- tick/cooldown
     def tick(self) -> None:
         if self._cooldown_left > 0:
             self._cooldown_left -= 1
@@ -42,7 +41,6 @@ class ExpertGate:
     def set_weight_store(self, ws: Any) -> None:
         self.weight_store = ws
 
-    # alias to avoid old code calling should_explore()
     def should_explore(self) -> bool:
         return self._should_explore()
 
@@ -53,77 +51,63 @@ class ExpertGate:
             return False
         return self.rng.random() < self.epsilon
 
-    # ------------------------
-    # Core pick
-    # ------------------------
     def pick(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> Tuple[ExpertDecision, List[ExpertDecision]]:
-        """
-        Returns (best_decision, all_decisions).
-        best_decision.score is ORIGINAL score from expert.
-        We add meta['score_adj'] and meta['weight'] for debugging/training.
-        """
-        experts = self.registry.get_all()
+        experts = []
+        try:
+            experts = list(self.registry.get_all())
+        except Exception:
+            experts = []
+
         if not experts:
-            return ExpertDecision(expert="NO_EXPERTS", score=0.0, allow=False, meta={"reason": "empty_registry"})
+            return (
+                ExpertDecision(expert="NO_EXPERTS", score=0.0, allow=False, meta={"reason": "empty_registry"}),
+                [],
+            )
 
         decisions: List[ExpertDecision] = []
-        for exp in self.registry.get_all():
+        for exp in experts:
             try:
                 d = exp.decide(trade_features, context)
                 if d is None:
                     continue
-                # ensure expert label
                 if getattr(d, "expert", None) in (None, "", "UNKNOWN_EXPERT"):
                     try:
-                        d.expert = getattr(exp, "name", None) or getattr(exp, "__class__", type("X", (), {})).__name__
+                        d.expert = getattr(exp, "name", None) or exp.__class__.__name__
                     except Exception:
                         pass
                 decisions.append(d)
-            except Exception:
-                continue
+            except Exception as e:
+                # don't silently swallow; keep a trace decision for debugging
+                decisions.append(
+                    ExpertDecision(
+                        expert=getattr(exp, "name", None) or exp.__class__.__name__,
+                        allow=False,
+                        score=0.0,
+                        meta={"error": "decide_exception", "exc": repr(e)},
+                    )
+                )
 
+        # If all failed/none, return a deterministic deny with meta
         if not decisions:
-            # emergency fallback
-            dummy = ExpertDecision(expert="NO_EXPERT", allow=False, score=0.0, meta={})
+            dummy = ExpertDecision(expert="NO_DECISIONS", allow=False, score=0.0, meta={"reason": "all_none"})
             return dummy, []
 
         regime = str(context.get("regime", "UNKNOWN"))
 
         def _adj_score(d: ExpertDecision) -> float:
-            s = float(getattr(d, "score", 0.0))
+            base = float(getattr(d, "score", 0.0))
             w = 1.0
             if self.weight_store is not None:
                 try:
-                    w = float(self.weight_store.get(str(getattr(d, "expert", "UNKNOWN_EXPERT")), regime, 1.0))
+                    w = float(self.weight_store.get(str(getattr(d, "expert", "")), regime, 1.0))
                 except Exception:
                     w = 1.0
-            return s * w
-
-        # choose best by adjusted score
- # ---- choose best (PRIORITIZE allow=True) ----
-        def _adj_score(d):
-            base = float(getattr(d, "score", 0.0))
-            w = 1.0
-            try:
-                if self.weight_store is not None:
-                    w = float(self.weight_store.get(
-                        str(getattr(d, "expert", "")),
-                        str(context.get("regime")),
-                        1.0
-                    ))
-            except Exception:
-                w = 1.0
             return base * w
 
         allow_decisions = [d for d in decisions if bool(getattr(d, "allow", False))]
-
-        if allow_decisions:
-            best = max(allow_decisions, key=_adj_score)
-        else:
-            best = max(decisions, key=_adj_score)
+        best = max(allow_decisions, key=_adj_score) if allow_decisions else max(decisions, key=_adj_score)
 
         best_adj = _adj_score(best)
-
 
         # attach debug meta
         try:
@@ -132,7 +116,7 @@ class ExpertGate:
             w_best = 1.0
             if self.weight_store is not None:
                 try:
-                    w_best = float(self.weight_store.get(str(getattr(best, "expert", "UNKNOWN_EXPERT")), regime, 1.0))
+                    w_best = float(self.weight_store.get(str(getattr(best, "expert", "")), regime, 1.0))
                 except Exception:
                     w_best = 1.0
             best.meta["weight"] = w_best
@@ -142,11 +126,9 @@ class ExpertGate:
 
         # exploration: if best is near-miss and we explore, allow it forcibly
         if best_adj < self.soft_threshold and self._should_explore():
-            # pick a near-miss candidate among allow=False (or lowest margin)
             sorted_by_adj = sorted(decisions, key=_adj_score, reverse=True)
             pick2 = None
             for d in sorted_by_adj:
-                # near-miss means close to best (or just next)
                 if d is best:
                     continue
                 pick2 = d
@@ -166,4 +148,3 @@ class ExpertGate:
                 return pick2, decisions
 
         return best, decisions
-

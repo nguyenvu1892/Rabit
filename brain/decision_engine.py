@@ -2,16 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from tkinter import S
 from typing import Any, Dict, List, Optional, Tuple
-
-from brain.regime_detector import detect_regime
-
-from brain.experts.expert_registry import ExpertRegistry, build_default_registry
-from brain.experts.expert_gate import ExpertGate
-# NOTE:
-# - Avoid circular imports: keep these imports local when needed.
-# - DecisionEngine must work even if meta layer is absent / optional.
 
 
 @dataclass
@@ -25,36 +16,43 @@ class EngineDecision:
 class DecisionEngine:
     """
     Coordinates:
-    - Regime detection
-    - ExpertGate picking (uses WeightStore if provided)
-    - (Optional) MetaController hooks
+      - Regime detection
+      - ExpertGate picking (uses WeightStore if provided)
+      - (Optional) MetaController hooks
     """
 
     def __init__(
         self,
-        risk_engine: None,
+        risk_engine: Any,
         weight_store: Optional[Any] = None,
-        registry=None,
         meta_controller: Optional[Any] = None,
         enable_meta: bool = True,
         *,
         epsilon: float = 0.0,
         epsilon_cooldown: int = 0,
         seed: Optional[int] = None,
-        **kwargs) -> None:
+    ) -> None:
         self.risk_engine = risk_engine
         self.weight_store = weight_store
 
         # --- gate / registry ---
-        if registry is None:
-            registry = build_default_registry()
-        self.registry: ExpertRegistry = registry
-        self.gate = ExpertGate(registry=self.registry, weight_store=self.weight_store)
+        self.registry = self._build_registry()
+        self.gate = self._build_gate(
+            registry=self.registry,
+            weight_store=self.weight_store,
+            epsilon=epsilon,
+            epsilon_cooldown=epsilon_cooldown,
+            seed=seed,
+        )
 
         # --- meta (optional) ---
-        self.meta = meta_controller
+        self.meta = None
         if enable_meta:
             self.meta = self._build_meta(meta_controller)
+
+        # store exploration params (debug)
+        self.epsilon = float(epsilon)
+        self.epsilon_cooldown = int(epsilon_cooldown)
 
     # -------------------------
     # Builders (robust)
@@ -62,34 +60,125 @@ class DecisionEngine:
     def _build_registry(self) -> Any:
         """
         Create ExpertRegistry and register experts.
-        Keep imports local to avoid circular dependencies.
+
+        Robust strategy:
+          - import experts modules
+          - auto-discover register_* functions
+          - accept common API patterns
+          - fallback baseline expert if registry stays empty
         """
         from brain.experts.expert_registry import ExpertRegistry
 
         reg = ExpertRegistry()
 
-        # Register basic experts if available
-        try:
-            from brain.experts.experts_basic import register_basic_experts  # type: ignore
+        def _reg_add(expert_obj: Any) -> bool:
+            """Try multiple registry APIs to add/register an expert instance."""
+            for meth in ("register", "add", "add_expert", "register_expert"):
+                if hasattr(reg, meth):
+                    try:
+                        getattr(reg, meth)(expert_obj)
+                        return True
+                    except Exception:
+                        continue
+            return False
 
-            register_basic_experts(reg)
-        except Exception:
-            # Fallback: try importing module side-effects
+        def _get_all() -> List[Any]:
+            for meth in ("get_all", "all", "list", "values"):
+                if hasattr(reg, meth):
+                    try:
+                        xs = getattr(reg, meth)()
+                        return list(xs) if xs is not None else []
+                    except Exception:
+                        pass
+            return []
+
+        def _maybe_register_module(mod: Any) -> None:
+            """
+            Accept patterns:
+              - register(reg)
+              - register_experts(reg)
+              - register_basic_experts(reg)
+              - register_simple_experts(reg)
+              - any function starting with 'register_' that accepts 1 arg
+              - EXPERTS list/tuple of expert instances
+              - build_experts()/make_experts() returning list
+            """
+            # explicit known names
+            for fn_name in (
+                "register",
+                "register_experts",
+                "register_basic_experts",
+                "register_simple_experts",
+            ):
+                fn = getattr(mod, fn_name, None)
+                if callable(fn):
+                    try:
+                        fn(reg)
+                    except Exception:
+                        pass
+
+            # auto any register_* (1 arg)
+            for name in dir(mod):
+                if not name.startswith("register_"):
+                    continue
+                fn = getattr(mod, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    fn(reg)
+                except TypeError:
+                    # wrong signature
+                    continue
+                except Exception:
+                    continue
+
+            # EXPERTS iterable
+            exps = getattr(mod, "EXPERTS", None)
+            if isinstance(exps, (list, tuple)):
+                for e in exps:
+                    _reg_add(e)
+
+            # builder funcs returning list
+            for fn_name in ("build_experts", "make_experts", "create_experts"):
+                fn = getattr(mod, fn_name, None)
+                if callable(fn):
+                    try:
+                        xs = fn()
+                        if isinstance(xs, (list, tuple)):
+                            for e in xs:
+                                _reg_add(e)
+                    except Exception:
+                        pass
+
+        # Try import modules (no hard dependency on exact function names)
+        for mod_path in (
+            "brain.experts.experts_basic",
+            "brain.experts.simple_experts",
+            "brain.experts.experts",
+        ):
             try:
-                import brain.experts.experts_basic  # noqa: F401
+                mod = __import__(mod_path, fromlist=["*"])
+                _maybe_register_module(mod)
             except Exception:
-                pass
+                continue
 
-        # Register simple experts if available
-        try:
-            from brain.experts.simple_experts import register_simple_experts  # type: ignore
+        # Fallback: if still empty, add a baseline expert so system doesn't hard-deny everything
+        if len(_get_all()) == 0:
+            from brain.experts.expert_base import ExpertDecision
 
-            register_simple_experts(reg)
-        except Exception:
-            try:
-                import brain.experts.simple_experts  # noqa: F401
-            except Exception:
-                pass
+            class BaselineExpert:
+                name = "BASELINE"
+
+                def decide(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
+                    # minimal allow to keep pipeline alive; score small so real experts override when available
+                    return ExpertDecision(
+                        expert=self.name,
+                        allow=True,
+                        score=0.01,
+                        meta={"fallback": True, "reason": "registry_empty"},
+                    )
+
+            _reg_add(BaselineExpert())
 
         return reg
 
@@ -103,7 +192,6 @@ class DecisionEngine:
     ) -> Any:
         from brain.experts.expert_gate import ExpertGate
 
-        # Some versions accept rng, some accept seed, some accept weight_store.
         kwargs: Dict[str, Any] = {
             "registry": registry,
             "epsilon": float(epsilon),
@@ -121,11 +209,12 @@ class DecisionEngine:
             except Exception:
                 pass
 
+        # Try create with richest signature first
         try:
             return ExpertGate(**kwargs)
         except TypeError:
-            # fallback: remove unknown keys one by one
-            for k in ["weight_store", "rng", "epsilon_cooldown"]:
+            # fallback: remove unknown keys
+            for k in ("weight_store", "rng", "epsilon_cooldown"):
                 if k in kwargs:
                     tmp = dict(kwargs)
                     tmp.pop(k, None)
@@ -133,21 +222,17 @@ class DecisionEngine:
                         return ExpertGate(**tmp)
                     except TypeError:
                         continue
-            # last resort
             return ExpertGate(registry=registry)
 
     def _build_meta(self, meta_controller: Optional[Any]) -> Optional[Any]:
         if meta_controller is not None:
             return meta_controller
-
-        # Try auto-create MetaController if module exists
         try:
             from brain.meta_controller import MetaController  # type: ignore
 
             try:
                 return MetaController()
             except TypeError:
-                # some versions might require args; disable if cannot instantiate
                 return None
         except Exception:
             return None
@@ -156,29 +241,20 @@ class DecisionEngine:
     # Exploration control
     # -------------------------
     def set_exploration(self, epsilon: float, cooldown: int = 0) -> None:
-        """
-        Called by ShadowRunner periodically.
-        """
-        # keep on engine (useful for logging/debug)
         self.epsilon = float(epsilon)
         self.epsilon_cooldown = int(cooldown)
 
-        # pass-through to gate if available
         if hasattr(self.gate, "set_epsilon"):
             try:
                 self.gate.set_epsilon(float(epsilon))
             except Exception:
                 pass
 
-        # some gate versions expose epsilon_cooldown directly
         try:
             if hasattr(self.gate, "epsilon_cooldown"):
                 setattr(self.gate, "epsilon_cooldown", int(cooldown))
         except Exception:
             pass
-
-        # some gate versions have tick/cooldown internal
-        # (ShadowRunner should call gate.tick() each step if it exists)
 
     # -------------------------
     # Core evaluation
@@ -187,17 +263,19 @@ class DecisionEngine:
         """
         Return: (allow, score, risk_cfg)
         """
+        from brain.regime_detector import detect_regime
+
         candles: List[Any] = trade_features.get("candles") or trade_features.get("window") or []
         context: Dict[str, Any] = detect_regime(candles) if candles is not None else {"regime": "UNKNOWN"}
 
-        # Meta pre-hook (optional)
+        # Meta pre-hook
         if self.meta is not None and hasattr(self.meta, "pre_decision"):
             try:
                 self.meta.pre_decision(trade_features=trade_features, context=context)
             except Exception:
                 pass
 
-        best, all_decisions = self.gate.pick(trade_features, context)
+        best, _all_decisions = self.gate.pick(trade_features, context)
 
         # Normalize best decision shape
         if isinstance(best, dict):
@@ -213,15 +291,14 @@ class DecisionEngine:
             if meta is not None and not isinstance(meta, dict):
                 meta = None
 
-        # Build risk cfg
         risk_cfg: Dict[str, Any] = {
             "expert": expert_name,
             "regime": context.get("regime", "UNKNOWN"),
         }
         if meta:
-            risk_cfg.update({"meta": meta})
+            risk_cfg["meta"] = meta
 
-        # Meta post-hook (optional)
+        # Meta post-hook
         if self.meta is not None and hasattr(self.meta, "post_decision"):
             try:
                 self.meta.post_decision(
