@@ -101,30 +101,33 @@ class WeightStore:
     # -----------------------------
     # Stabilizers (5.0.8.3+)
     # -----------------------------
-    def decay_toward(
-        self,
-        target: float = 1.0,
-        rate: float = 0.01,
-        regime: Optional[str] = None,
-    ) -> None:
+    def decay_toward(self, target: float = 1.0, rate: float = 0.002, regime: Optional[str] = None) -> None:
         """
-        Softly decay weights toward target to avoid runaway overfit.
-        w := w + rate * (target - w)
+        Pull weights slowly back toward target (default 1.0).
+        rate small => stable. Suggested 0.001~0.01.
         """
-        r = self.default_regime if regime is None else str(regime)
-        if r not in self._w:
+        if rate <= 0:
             return
-        t = float(target)
-        a = float(rate)
-        for e, w in list(self._w[r].items()):
-            nw = _clamp(w + a * (t - w), self.min_w, self.max_w)
-            self._w[r][e] = nw
+
+        def _decay_map(mp: Dict[str, float]) -> None:
+            for k, v in list(mp.items()):
+                v = float(v)
+                v = v + (target - v) * float(rate)
+                mp[k] = float(self._clamp(v))
+
+        if regime is not None:
+            mp = self.weights.get(regime)
+            if mp:
+                _decay_map(mp)
+        else:
+            for _, mp in self.weights.items():
+                _decay_map(mp)
 
     def normalize_mean(
         self,
         regime: Optional[str] = None,
         target_mean: float = 1.0,
-    ) -> None:
+        ) -> None:
         """
         Scale all weights so that mean becomes target_mean.
         Useful to keep the bucket stable.
@@ -143,15 +146,34 @@ class WeightStore:
         for e, w in list(bucket.items()):
             bucket[e] = _clamp(w * scale, self.min_w, self.max_w)
 
-    def topk(self, k: int = 5, regime: Optional[str] = None) -> List[Tuple[str, float]]:
-        r = self.default_regime if regime is None else str(regime)
-        bucket = self._w.get(r, {})
-        return sorted(bucket.items(), key=lambda x: x[1], reverse=True)[: max(0, int(k))]
+    def normalize_bucket(self, regime: str, target_mean: float = 1.0) -> None:
+        """Normalize a regime bucket so mean weight ~= target_mean."""
+        mp = self.weights.get(regime)
+        if not mp:
+            return
+        vals = [float(v) for v in mp.values()]
+        if not vals:
+            return
+        mean = sum(vals) / max(1, len(vals))
+        if mean <= 0:
+            return
+        scale = float(target_mean) / float(mean)
+        for k, v in list(mp.items()):
+            mp[k] = float(self._clamp(float(v) * scale))
 
-    def bottomk(self, k: int = 5, regime: Optional[str] = None) -> List[Tuple[str, float]]:
-        r = self.default_regime if regime is None else str(regime)
-        bucket = self._w.get(r, {})
-        return sorted(bucket.items(), key=lambda x: x[1])[: max(0, int(k))]
+    def normalize_all_buckets(self, target_mean: float = 1.0) -> None:
+        for regime in list(self.weights.keys()):
+            self.normalize_bucket(regime, target_mean=target_mean)
+
+    def topk(self, regime: str, k: int = 3) -> List[Tuple[str, float]]:
+        mp = self.weights.get(regime) or {}
+        items = sorted(((str(a), float(b)) for a, b in mp.items()), key=lambda x: x[1], reverse=True)
+        return items[: max(1, k)]
+
+    def bottomk(self, regime: str, k: int = 3) -> List[Tuple[str, float]]:
+        mp = self.weights.get(regime) or {}
+        items = sorted(((str(a), float(b)) for a, b in mp.items()), key=lambda x: x[1])
+        return items[: max(1, k)]
 
     def normalize_bucket(
         self,

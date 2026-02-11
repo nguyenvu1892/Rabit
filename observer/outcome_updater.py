@@ -23,21 +23,31 @@ class OutcomeUpdater:
 
     def __init__(
         self,
-        learner: Optional["ReinforcementLearner"],
-        trade_memory: TradeMemory,
-        weight_store: Optional["WeightStore"] = None,
-        weights_path: Optional[str] = None,
-        autosave: bool = True,
-        save_every: int = 25,          # save weights every N outcomes
-        decay_every: int = 50,         # apply decay every N outcomes
-        decay_rate: float = 0.01,      # pull toward 1.0
-        forced_penalty: float = 0.15,  # reduce weight impact when forced
-        lr: float = 0.05,              # learning rate for weight bump
-        clamp_min: float = 0.2,
-        clamp_max: float = 5.0,
-    ) -> None:
+        learner,
+        trade_memory,
+        weight_store=None,
+        weights_path=None,
+        autosave=True,
+        # --- new (5.0.8.7) ---
+        stabilize_every: int = 25,
+        decay_rate: float = 0.002,
+        normalize_every: int = 25,
+        summary_every: int = 50,
+        summary_k: int = 3,
+    ):
         self.learner = learner
         self.trade_memory = trade_memory
+        self.weight_store = weight_store
+        self.weights_path = weights_path
+        self.autosave = autosave
+
+        self.stabilize_every = int(stabilize_every)
+        self.decay_rate = float(decay_rate)
+        self.normalize_every = int(normalize_every)
+        self.summary_every = int(summary_every)
+        self.summary_k = int(summary_k)
+
+        self._outcome_count = 0
 
         # lazy init WeightStore to avoid circular import
         self.weight_store = weight_store
@@ -77,13 +87,10 @@ class OutcomeUpdater:
         self.w_min = 0.2
         self.w_max = 5.0
 
-        self.decay_rate = float(decay_rate)
         self.forced_penalty = float(forced_penalty)
         self.lr = float(lr)
         self.clamp_min = float(clamp_min)
         self.clamp_max = float(clamp_max)
-
-        self._outcomes_seen = 0
 
     def _extract(self, outcome: Dict[str, Any]) -> Dict[str, Any]:
         """
