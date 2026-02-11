@@ -191,6 +191,9 @@ def main():
             print(f"[shadow_run] WARN: reporter finalize failed: {e}")
 
     print("=== SHADOW RUN DONE ===")
+    ws_dict = weight_store.to_dict() if hasattr(weight_store, "to_dict") else {}
+    print("WEIGHT SIZE:", len(ws_dict))
+
     for k, v in stats_dict.items():
         print(f"{k}: {v}")
 

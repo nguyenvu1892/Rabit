@@ -97,7 +97,7 @@ class WeightStore:
     # ------------------------
     # Persistence
     # ------------------------
-    def load(self, data: dict) -> None:
+    def load(self, path: Optional[str] = None) -> None:
         p = path or self.path
         if not p:
             return
@@ -122,6 +122,18 @@ class WeightStore:
         with open(p, "w", encoding="utf-8") as f:
             json.dump(self._w, f, indent=2, sort_keys=True)
         self._updates_since_save = 0
+    def to_dict(self) -> dict:
+        """
+        Export weights as a plain nested dict for logging/debug/report.
+        Structure: {bucket: {key: weight}}
+        """
+        out: dict = {}
+        for bucket, mp in getattr(self, "weights", {}).items():
+            out[bucket] = {k: float(v) for k, v in mp.items()}
+        return out
+
+    # alias để tương thích nếu chỗ khác dùng tên khác
+    as_dict = to_dict
 
     # ------------------------
     # Core accessors
@@ -294,7 +306,6 @@ class WeightStore:
             return True
         except Exception:
             return False
-
     def save_json(self, path: str) -> bool:
         # backward-compat
         return self.save(path)
