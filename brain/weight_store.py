@@ -41,12 +41,21 @@ class WeightStore:
         min_w: float = 0.2,
         max_w: float = 5.0,
         default_regime: str = "global",
+        path: str | None = None,          # ✅ add
     ) -> None:
         self.init_weight = float(init_weight)
         self.min_w = float(min_w)
         self.max_w = float(max_w)
         self.default_regime = str(default_regime)
         self._w: Dict[str, Dict[str, float]] = {}
+
+        # ✅ backward-compatible: allow WeightStore(path=...)
+        if path:
+            try:
+                self.load_json(path)
+            except Exception:
+                pass
+
 
     # -----------------------------
     # Core access
