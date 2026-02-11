@@ -12,6 +12,7 @@ from brain.reinforcement_learner import ReinforcementLearner
 from brain.weight_store import WeightStore
 from observer.outcome_updater import OutcomeUpdater
 from brain.trade_memory import TradeMemory
+from observer.eval_reporter import EvalReporter
 
 
 def _import_risk_engine():
