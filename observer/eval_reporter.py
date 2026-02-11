@@ -1,167 +1,138 @@
+# observer/eval_reporter.py
 from __future__ import annotations
 
 import json
-import os
 import time
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, Tuple, List
-
-
-def _now_ts() -> float:
-    return time.time()
-
-
-def _ts_label(ts: Optional[float] = None) -> str:
-    ts = ts if ts is not None else _now_ts()
-    return time.strftime("%Y%m%d_%H%M%S", time.localtime(ts))
-
-
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float(default)
-
-
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _flatten_weights(weights: Dict[str, Dict[str, float]]) -> List[Tuple[str, str, float]]:
-    out: List[Tuple[str, str, float]] = []
-    for bucket, sub in (weights or {}).items():
-        if not isinstance(sub, dict):
-            continue
-        for key, val in sub.items():
-            out.append((str(bucket), str(key), _safe_float(val, 1.0)))
-    return out
-
-
-def _top_bottom(flat: List[Tuple[str, str, float]], k: int = 5) -> Dict[str, Any]:
-    if not flat:
-        return {"top": [], "bottom": []}
-    flat_sorted = sorted(flat, key=lambda x: x[2], reverse=True)
-    top = flat_sorted[:k]
-    bottom = list(reversed(flat_sorted[-k:]))
-    return {
-        "top": [{"bucket": b, "key": kk, "w": v} for (b, kk, v) in top],
-        "bottom": [{"bucket": b, "key": kk, "w": v} for (b, kk, v) in bottom],
-    }
-
-
-def _drift_score(prev: Dict[str, Dict[str, float]], curr: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    """
-    Drift score: L1 mean abs diff over overlapping keys + new-key ratio.
-    Lightweight & stable.
-    """
-    prev_flat = {(b, k): _safe_float(v, 1.0) for b, sub in (prev or {}).items() for k, v in (sub or {}).items()}
-    curr_flat = {(b, k): _safe_float(v, 1.0) for b, sub in (curr or {}).items() for k, v in (sub or {}).items()}
-
-    overlap = set(prev_flat.keys()) & set(curr_flat.keys())
-    if overlap:
-        l1 = sum(abs(curr_flat[x] - prev_flat[x]) for x in overlap)
-        mean_l1 = l1 / max(1, len(overlap))
-    else:
-        mean_l1 = 0.0
-
-    new_keys = len(set(curr_flat.keys()) - set(prev_flat.keys()))
-    new_ratio = new_keys / max(1, len(curr_flat))
-
-    return {"mean_abs_delta": float(mean_l1), "new_key_ratio": float(new_ratio)}
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 
 @dataclass
-class EvalRunMeta:
+class EvalRecord:
+    ts: float
     run_id: str
-    created_ts: float
-    source: str = "shadow_run"
+    stats: Dict[str, Any]
+    extra: Dict[str, Any]
 
 
 class EvalReporter:
     """
-    5.1.1: Report schema + writer.
-
-    You can:
-      - call snapshot_weights(weight_store) at start/end to compute drift
-      - call record_summary(summary_dict) after shadow_run completes
-      - write_report(...) to JSON file
+    Minimal evaluation reporter.
+    - Can print a compact summary
+    - Can append to a JSONL file (one record per run)
+    - Optional: snapshot weights before/after a run
     """
 
-    def __init__(self, out_dir: str = "data/reports", run_id: Optional[str] = None) -> None:
-        self.out_dir = out_dir
-        _ensure_dir(self.out_dir)
+    def __init__(
+        self,
+        out_path: Optional[str] = None,
+        run_id: Optional[str] = None,
+        out_dir: Optional[str] = None,
+        filename: str = "eval_report.jsonl",
+    ) -> None:
+        self.run_id = run_id or f"run_{int(time.time())}"
+        self.out_path: Optional[str] = None
 
-        ts = _now_ts()
-        self.meta = EvalRunMeta(
-            run_id=run_id or f"run_{_ts_label(ts)}",
-            created_ts=ts,
-        )
+        # Resolve output path
+        if out_path:
+            self.out_path = str(out_path)
+        elif out_dir:
+            self.out_path = str(Path(out_dir) / filename)
+        else:
+            self.out_path = None
 
-        self._weights_before: Dict[str, Dict[str, float]] = {}
-        self._weights_after: Dict[str, Dict[str, float]] = {}
-        self._summary: Dict[str, Any] = {}
+        if self.out_path:
+            Path(self.out_path).parent.mkdir(parents=True, exist_ok=True)
 
+        self._weights_before: Optional[Dict[str, Any]] = None
+        self._weights_after: Optional[Dict[str, Any]] = None
+
+    # -------------------------
+    # Weight snapshots (used by shadow_run)
+    # -------------------------
     def snapshot_weights_before(self, weight_store: Any) -> None:
-        self._weights_before = self._read_weights(weight_store)
+        self._weights_before = self._snapshot_weights(weight_store)
 
     def snapshot_weights_after(self, weight_store: Any) -> None:
-        self._weights_after = self._read_weights(weight_store)
+        self._weights_after = self._snapshot_weights(weight_store)
 
-    def record_summary(self, summary: Dict[str, Any]) -> None:
-        self._summary = dict(summary or {})
-
-    def build_report(self) -> Dict[str, Any]:
-        flat_after = _flatten_weights(self._weights_after)
-        report: Dict[str, Any] = {
-            "meta": asdict(self.meta),
-            "summary": self._summary,
-            "weights": {
-                "after_top_bottom": _top_bottom(flat_after, k=5),
-                "drift": _drift_score(self._weights_before, self._weights_after),
-                "counts": {
-                    "buckets": len(self._weights_after or {}),
-                    "keys_total": len(flat_after),
-                },
-            },
-        }
-        return report
-
-    def write_report(self, filename: Optional[str] = None) -> str:
-        report = self.build_report()
-        fname = filename or f"{self.meta.run_id}.json"
-        path = os.path.join(self.out_dir, fname)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False, sort_keys=True)
-        return path
-
-    # -----------------------
-    # internals
-    # -----------------------
-    def _read_weights(self, weight_store: Any) -> Dict[str, Dict[str, float]]:
-        # Support multiple WeightStore implementations
+    def _snapshot_weights(self, weight_store: Any) -> Dict[str, Any]:
         if weight_store is None:
             return {}
-        # common: internal dict
-        for attr in ("_w", "weights", "store", "data"):
-            if hasattr(weight_store, attr):
+
+        # Duck-typing to avoid tight coupling
+        for name in ("to_dict", "as_dict", "dump", "export", "snapshot"):
+            fn = getattr(weight_store, name, None)
+            if callable(fn):
                 try:
-                    w = getattr(weight_store, attr)
-                    if isinstance(w, dict):
-                        # nested dict expected
-                        return {str(b): {str(k): _safe_float(v, 1.0) for k, v in (sub or {}).items()}
-                                for b, sub in w.items()
-                                if isinstance(sub, dict)}
+                    data = fn()
+                    if isinstance(data, dict):
+                        return data
                 except Exception:
                     pass
-        # fallback: try export method
-        for fn in ("to_dict", "dump", "export"):
-            if hasattr(weight_store, fn):
-                try:
-                    w = getattr(weight_store, fn)()
-                    if isinstance(w, dict):
-                        return {str(b): {str(k): _safe_float(v, 1.0) for k, v in (sub or {}).items()}
-                                for b, sub in w.items()
-                                if isinstance(sub, dict)}
-                except Exception:
-                    pass
+
+        # fallback: try known common attribute
+        w = getattr(weight_store, "weights", None)
+        if isinstance(w, dict):
+            return w
+
         return {}
+
+    # -------------------------
+    # Reporting
+    # -------------------------
+    def summarize(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        # Keep compatible with ShadowRunner stats keys
+        decisions = int(stats.get("decisions", 0) or 0)
+        allow = int(stats.get("allow", 0) or 0)
+        deny = int(stats.get("deny", 0) or 0)
+        errors = int(stats.get("errors", 0) or 0)
+
+        wins = int(stats.get("wins", 0) or 0)
+        losses = int(stats.get("losses", 0) or 0)
+        total_pnl = float(stats.get("total_pnl", 0.0) or 0.0)
+
+        return {
+            "decisions": decisions,
+            "allow": allow,
+            "deny": deny,
+            "errors": errors,
+            "wins": wins,
+            "losses": losses,
+            "total_pnl": total_pnl,
+        }
+
+    def write(self, stats: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> Optional[EvalRecord]:
+        extra = extra or {}
+        record = EvalRecord(
+            ts=time.time(),
+            run_id=self.run_id,
+            stats=self.summarize(stats),
+            extra=extra,
+        )
+
+        payload: Dict[str, Any] = {
+            "ts": record.ts,
+            "run_id": record.run_id,
+            "stats": record.stats,
+            "extra": record.extra,
+        }
+
+        if self._weights_before is not None:
+            payload["weights_before"] = self._weights_before
+        if self._weights_after is not None:
+            payload["weights_after"] = self._weights_after
+
+        if self.out_path:
+            with open(self.out_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        return record
+
+    def print_summary(self, stats: Dict[str, Any]) -> None:
+        s = self.summarize(stats)
+        print(
+            f"[EvalReporter] decisions={s['decisions']} allow={s['allow']} deny={s['deny']} "
+            f"errors={s['errors']} wins={s['wins']} losses={s['losses']} pnl={s['total_pnl']:.4f}"
+        )

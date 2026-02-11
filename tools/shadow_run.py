@@ -14,6 +14,8 @@ from observer.outcome_updater import OutcomeUpdater
 from brain.trade_memory import TradeMemory
 from observer.eval_reporter import EvalReporter
 
+reporter = EvalReporter(out_dir="data/reports")
+reporter.snapshot_weights_before(weight_store)
 
 def _import_risk_engine():
     # Project structure moved a few times; support both.
