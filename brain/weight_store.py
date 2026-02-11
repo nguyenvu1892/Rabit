@@ -285,3 +285,11 @@ class WeightStore:
         for b, kk, v in bottom:
             print(f"    {b} / {kk} = {v:.4f}")
         print("")
+
+    def load_json(self, path: str) -> bool:
+        # backward-compat for older callers (tools/shadow_run.py, etc.)
+        return self.load(path)
+
+    def save_json(self, path: str) -> bool:
+        # backward-compat
+        return self.save(path)
