@@ -40,7 +40,6 @@ def _import_risk_engine():
 
 
 def _stats_to_dict(stats: Any) -> Dict[str, Any]:
-    # ShadowStats in your project is usually a dataclass-like object.
     if stats is None:
         return {}
     if isinstance(stats, dict):
@@ -50,7 +49,7 @@ def _stats_to_dict(stats: Any) -> Dict[str, Any]:
             return dict(stats.to_dict())
         except Exception:
             pass
-    # Fallback: use attributes
+
     d: Dict[str, Any] = {}
     for k in [
         "steps",
@@ -69,12 +68,27 @@ def _stats_to_dict(stats: Any) -> Dict[str, Any]:
     return d
 
 
+def _weight_pair_count(ws: Optional[WeightStore]) -> int:
+    if ws is None:
+        return 0
+    try:
+        d = ws.to_dict()
+        return sum(len(sub) for sub in d.values())
+    except Exception:
+        try:
+            return len(ws)
+        except Exception:
+            return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--csv", required=True)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--lookback", type=int, default=300)
     ap.add_argument("--max-steps", type=int, default=2000)
+
     ap.add_argument("--train", action="store_true")
     ap.add_argument("--horizon", type=int, default=30)
 
@@ -101,12 +115,8 @@ def main():
     # Weight store
     weight_store: Optional[WeightStore] = None
     if args.weights:
-        weight_store = WeightStore()
-        # Your WeightStore API has changed a few times; support both.
-        if hasattr(weight_store, "load_json") and callable(getattr(weight_store, "load_json")):
-            weight_store.load_json(args.weights)
-        elif hasattr(weight_store, "load") and callable(getattr(weight_store, "load")):
-            weight_store.load(args.weights)
+        # IMPORTANT: init with path => auto-load if file exists
+        weight_store = WeightStore(path=args.weights)
 
     # Reporter (optional)
     reporter = None
@@ -167,7 +177,6 @@ def main():
             if weight_store is not None and hasattr(reporter, "snapshot_weights_after"):
                 reporter.snapshot_weights_after(weight_store)
 
-            # Prefer write()/finalize() if exists
             if hasattr(reporter, "write") and callable(getattr(reporter, "write")):
                 reporter.write(
                     stats=stats_dict,
@@ -191,9 +200,7 @@ def main():
             print(f"[shadow_run] WARN: reporter finalize failed: {e}")
 
     print("=== SHADOW RUN DONE ===")
-    ws_dict = weight_store.to_dict() if hasattr(weight_store, "to_dict") else {}
-    print("WEIGHT SIZE:", len(ws_dict))
-
+    print("WEIGHT SIZE:", _weight_pair_count(weight_store))
     for k, v in stats_dict.items():
         print(f"{k}: {v}")
 

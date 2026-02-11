@@ -42,17 +42,17 @@ class WeightStoreConfig:
 class WeightStore:
     """
     WeightStore:
-      - stores weights by bucket/key (nested dict)
-      - for 5.0.8.9: treat (expert, regime) as (bucket, key)
-        e.g. bucket="London", key="trend_up" (or any regime id)
+    - stores weights by bucket/key (nested dict)
+    - for 5.0.8.9: treat (expert, regime) as (bucket, key)
+      e.g. bucket="London", key="trend_up" (or any regime id)
 
-    JSON format (stable, simple):
+    JSON format:
     {
       "bucketA": {"key1": 1.05, "key2": 0.97},
       "bucketB": {"keyX": 1.20}
     }
     """
-    @property
+
     def __init__(
         self,
         path: Optional[str] = None,
@@ -95,6 +95,27 @@ class WeightStore:
             self.load(self.path)
 
     # ------------------------
+    # Compatibility / helpers
+    # ------------------------
+    @property
+    def weights(self) -> Dict[str, Dict[str, float]]:
+        # keep backward compat for any code referencing .weights
+        return self._w
+
+    def __len__(self) -> int:
+        # total number of (bucket,key) pairs
+        return sum(len(sub) for sub in self._w.values())
+
+    def to_dict(self) -> Dict[str, Dict[str, float]]:
+        """Export weights as plain dict for logging/debug/report."""
+        out: Dict[str, Dict[str, float]] = {}
+        for bucket, mp in self._w.items():
+            out[str(bucket)] = {str(k): float(v) for k, v in mp.items()}
+        return out
+
+    as_dict = to_dict  # alias
+
+    # ------------------------
     # Persistence
     # ------------------------
     def load(self, path: Optional[str] = None) -> None:
@@ -103,14 +124,16 @@ class WeightStore:
             return
         if not os.path.exists(p):
             return
+
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f) or {}
-        # normalize to nested dict[str, dict[str,float]]
+
         out: Dict[str, Dict[str, float]] = {}
         if isinstance(data, dict):
             for bucket, sub in data.items():
                 if isinstance(sub, dict):
                     out[str(bucket)] = {str(k): _safe_float(v, 1.0) for k, v in sub.items()}
+
         self._w = out
         self._last_loaded_ts = _now_ts()
 
@@ -118,32 +141,31 @@ class WeightStore:
         p = path or self.path
         if not p:
             return
+
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             json.dump(self._w, f, indent=2, sort_keys=True)
-        self._updates_since_save = 0
-    def to_dict(self) -> dict:
-        """
-        Export weights as a plain nested dict for logging/debug/report.
-        Structure: {bucket: {key: weight}}
-        """
-        out: dict = {}
-        for bucket, mp in getattr(self, "weights", {}).items():
-            out[bucket] = {k: float(v) for k, v in mp.items()}
-        return out
 
-    # alias để tương thích nếu chỗ khác dùng tên khác
-    as_dict = to_dict
+        self._updates_since_save = 0
+
+    def load_json(self, path: str) -> bool:
+        try:
+            self.load(path)
+            return True
+        except Exception:
+            return False
+
+    def save_json(self, path: str) -> bool:
+        try:
+            self.save(path)
+            return True
+        except Exception:
+            return False
 
     # ------------------------
     # Core accessors
     # ------------------------
     def get(self, bucket: str, key: str, default: float = 1.0) -> float:
-        """
-        For 5.0.8.9:
-          bucket = expert_name
-          key    = regime_id
-        """
         b = self._w.get(str(bucket))
         if not b:
             return float(default)
@@ -178,13 +200,6 @@ class WeightStore:
         autosave: Optional[bool] = None,
         log: bool = False,
     ) -> float:
-        """
-        reward: should be signed (positive for good outcome, negative for bad)
-        Update rule (stable, simple):
-          w <- w + lr * reward
-          w <- w + decay * (1.0 - w)   (pull toward 1.0)
-          clamp
-        """
         _lr = float(lr) if lr is not None else float(self.cfg.lr)
         _decay = float(decay) if decay is not None else float(self.cfg.decay)
         _min = float(min_w) if min_w is not None else float(self.cfg.min_w)
@@ -197,29 +212,29 @@ class WeightStore:
         r = _safe_float(reward, 0.0)
 
         nxt = cur + (_lr * r)
-        # decay toward 1.0 (anti-overfit)
         nxt = nxt + (_decay * (1.0 - nxt))
-        # clamp
         nxt = max(_min, min(_max, float(nxt)))
 
         self._w[b][k] = nxt
 
-        # optional normalization within bucket
         if normalize_bucket:
             self._normalize_bucket(b, target_mean=float(target_mean), min_w=_min, max_w=_max)
 
-        # periodic bookkeeping
         self._updates_since_save += 1
         self._updates_since_log += 1
 
-        do_autosave = self.cfg.autosave_every_updates > 0 and (self._updates_since_save >= self.cfg.autosave_every_updates)
+        do_autosave = (
+            self.cfg.autosave_every_updates > 0
+            and (self._updates_since_save >= self.cfg.autosave_every_updates)
+        )
         if autosave is not None:
             do_autosave = bool(autosave)
-
         if do_autosave:
             self.save()
 
-        do_log = log or (self.cfg.log_every_updates > 0 and (self._updates_since_log >= self.cfg.log_every_updates))
+        do_log = log or (
+            self.cfg.log_every_updates > 0 and (self._updates_since_log >= self.cfg.log_every_updates)
+        )
         if do_log:
             self._updates_since_log = 0
             self.log_summary(title=f"WeightStore summary (last update: {b}/{k})")
@@ -232,7 +247,7 @@ class WeightStore:
     def clamp_all(self, *, min_w: Optional[float] = None, max_w: Optional[float] = None) -> None:
         _min = float(min_w) if min_w is not None else float(self.cfg.min_w)
         _max = float(max_w) if max_w is not None else float(self.cfg.max_w)
-        for b, sub in self._w.items():
+        for _, sub in self._w.items():
             for k, v in list(sub.items()):
                 sub[k] = max(_min, min(_max, _safe_float(v, 1.0)))
 
@@ -240,7 +255,7 @@ class WeightStore:
         r = float(rate) if rate is not None else float(self.cfg.decay)
         if r <= 0:
             return
-        for b, sub in self._w.items():
+        for _, sub in self._w.items():
             for k, v in list(sub.items()):
                 vv = _safe_float(v, 1.0)
                 vv = vv + r * (1.0 - vv)
@@ -250,19 +265,29 @@ class WeightStore:
         for b in list(self._w.keys()):
             self._normalize_bucket(b, target_mean=target_mean)
 
-    def _normalize_bucket(self, bucket: str, *, target_mean: float = 1.0, min_w: Optional[float] = None, max_w: Optional[float] = None) -> None:
+    def _normalize_bucket(
+        self,
+        bucket: str,
+        *,
+        target_mean: float = 1.0,
+        min_w: Optional[float] = None,
+        max_w: Optional[float] = None,
+    ) -> None:
         b = self._w.get(bucket)
         if not b:
             return
         vals = [float(_safe_float(v, 1.0)) for v in b.values()]
         if not vals:
             return
+
         cur_mean = sum(vals) / max(1, len(vals))
         if cur_mean <= 1e-9:
             return
+
         ratio = float(target_mean) / cur_mean
         _min = float(min_w) if min_w is not None else float(self.cfg.min_w)
         _max = float(max_w) if max_w is not None else float(self.cfg.max_w)
+
         for k, v in list(b.items()):
             nv = float(_safe_float(v, 1.0)) * ratio
             b[k] = max(_min, min(_max, nv))
@@ -274,53 +299,26 @@ class WeightStore:
     # Logging
     # ------------------------
     def log_summary(self, title: str = "WeightStore summary") -> None:
-        # top/bottom across all buckets, by value
         flat: list[Tuple[str, str, float]] = []
         for b, sub in self._w.items():
             for k, v in sub.items():
                 flat.append((b, k, _safe_float(v, 1.0)))
+
         if not flat:
             print(f"[WeightStore] {title}: (empty)")
             return
 
         flat.sort(key=lambda x: x[2], reverse=True)
-        k = max(1, int(self.cfg.top_k_log))
+        kk = max(1, int(self.cfg.top_k_log))
 
-        top = flat[:k]
-        bottom = list(reversed(flat[-k:]))
+        top = flat[:kk]
+        bottom = list(reversed(flat[-kk:]))
 
         print(f"\n[WeightStore] {title}")
-        print("  Top:")
-        for b, kk, v in top:
-            print(f"    {b} / {kk} = {v:.4f}")
-        print("  Bottom:")
-        for b, kk, v in bottom:
-            print(f"    {b} / {kk} = {v:.4f}")
+        print(" Top:")
+        for b, k, v in top:
+            print(f"  {b} / {k} = {v:.4f}")
+        print(" Bottom:")
+        for b, k, v in bottom:
+            print(f"  {b} / {k} = {v:.4f}")
         print("")
-    def weights(self) -> Dict[str, Dict[str, float]]:
-        # Backward/compat: expose internal map
-        return self._w
-
-    def to_dict(self) -> dict:
-        """Export weights as a plain nested dict for logging/debug/report."""
-        out: dict = {}
-        for bucket, mp in self._w.items():
-            out[str(bucket)] = {str(k): float(v) for k, v in mp.items()}
-        return out
-      # alias để tương thích nếu chỗ khác dùng tên khác
-    as_dict = to_dict
-            
-    def load_json(self, path: str) -> bool:
-        # backward-compat helper
-        try:
-            self.load(path)
-            return True
-        except Exception:
-            return False
-    def save_json(self, path: str) -> bool:
-        # backward-compat helper
-        try:
-            self.save(path)
-            return True
-        except Exception:
-            return False
