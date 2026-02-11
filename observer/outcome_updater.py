@@ -5,11 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from brain.reinforcement_learner import ReinforcementLearner
 from brain.trade_memory import TradeMemory
-
-try:
-    from brain.weight_store import WeightStore
-except Exception:  # pragma: no cover
-    WeightStore = None  # type: ignore
+from brain.weight_store import WeightStore
 
 
 class OutcomeUpdater:
@@ -128,3 +124,19 @@ class OutcomeUpdater:
                     print(f"[weights] outcomes={self._outcome_count} top_expert={top} bottom_expert={bot}")
                 except Exception:
                     pass
+        
+        atr = None
+        risk = outcome.get("risk") or {}
+        meta = outcome.get("meta") or {}
+        if isinstance(risk, dict):
+            atr = risk.get("atr", atr)
+        if isinstance(meta, dict):
+            atr = meta.get("atr", atr)
+
+        if atr is not None:
+            try:
+                atr = float(atr)
+                # atr lớn => reward nhỏ lại, tránh overfit theo spike
+                r *= 1.0 / (1.0 + max(0.0, atr))
+            except Exception:
+                pass
