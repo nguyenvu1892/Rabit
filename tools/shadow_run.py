@@ -49,13 +49,22 @@ def main():
 
     args = ap.parse_args()
 
+     # 1) init weight_store FIRST
+    weight_store = WeightStore(path=args.weights) if args.weights else None
+    if weight_store and args.weights:
+        # tùy implementation: WeightStore tự load trong __init__ hoặc cần load_json
+        # nếu WeightStore không auto-load, thì:
+        if hasattr(weight_store, "load_json"):
+            weight_store.load_json(args.weights)
+        # 2) reporter       
+
     random.seed(args.seed)
 
     candles = load_candles_csv(args.csv, limit=args.limit)
     journal = Journal(args.journal) if args.journal else None
 
     # Learner + weight store only matter in train mode
-    learner = ReinforcementLearner() if args.train else None
+    learner = ReinforcementLearner(weight_store=weight_store) if args.train else None
     # tạo weight_store nếu có --weights
     weight_store = WeightStore(path=args.weights) if args.weights else None
     if weight_store:
@@ -100,7 +109,11 @@ def main():
         epsilon_cooldown=args.epsilon_cooldown,
         journal=journal,
     )
-
+    reporter.snapshot_weights_after(weight_store)
+    reporter.print_summary(stats)
+    reporter.write(stats, extra={"weights_path": args.weights})
+    reporter = EvalReporter(out_dir="data/reports")
+    reporter.snapshot_weights_before(weight_store) 
     print("=== SHADOW RUN DONE ===")
     for k, v in stats.to_dict().items():
         print(f"{k}: {v}")
