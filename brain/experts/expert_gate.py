@@ -14,26 +14,19 @@ class ExpertGate:
     """
     Picks best expert decision.
 
-    Supports:
     - epsilon exploration (safe)
     - cooldown for exploration
-    - optional weight_store (WeightStore) to boost/penalize experts/regimes
+    - optional weight_store (WeightStore-like)
 
-    NOTE:
-    - WeightStore in this project uses: get(bucket, key, default=1.0)
-      where bucket usually: "expert", "regime", ...
+    IMPORTANT (5.0.8.5):
+    - Do NOT multiply raw weight directly (can explode).
+    - Use a safe multiplier: w ** power (sqrt by default).
     """
-
     registry: ExpertRegistry
     epsilon: float = 0.0
     epsilon_cooldown: int = 0
     rng: Optional[random.Random] = None
-
-    # expects WeightStore-like:
-    # - get(bucket, key, default=1.0)
-    # - (optional) get_expert(...) in older versions (we support via try/except)
     weight_store: Optional[Any] = None
-
     soft_threshold: float = 1.0001  # if best adjusted score < this => allow soft explore occasionally
 
     def __post_init__(self) -> None:
@@ -56,45 +49,53 @@ class ExpertGate:
         return self._rng.random() < self.epsilon
 
     def should_explore(self) -> bool:
-        # alias (prevents AttributeError from older code paths)
         return self._should_explore()
 
-    def _weight_multiplier(self, expert: str, regime: Optional[str]) -> float:
+    def _safe_multiplier(self, expert: str, regime: Optional[str]) -> float:
         """
-        Returns multiplicative weight:
-        - expert weight from bucket="expert"
-        - optional regime weight from bucket="regime"
+        Prefer WeightStore.multiplier(...) if available,
+        fallback to WeightStore.get(...) then sqrt ourselves.
         """
         if self.weight_store is None:
             return 1.0
 
-        w_exp = 1.0
-        w_reg = 1.0
+        m_exp = 1.0
+        m_reg = 1.0
 
-        # Preferred path: WeightStore.get(bucket, key, default)
+        # Expert
         try:
-            w_exp = float(self.weight_store.get("expert", expert, 1.0))
+            if hasattr(self.weight_store, "multiplier"):
+                m_exp = float(self.weight_store.multiplier("expert", expert, 1.0))
+            else:
+                w = float(self.weight_store.get("expert", expert, 1.0))
+                m_exp = max(0.2, min(10.0, w)) ** 0.5
         except TypeError:
-            # Back-compat if someone had WeightStore.get(expert)
+            # older signature: get(expert)
             try:
-                w_exp = float(self.weight_store.get(expert))  # type: ignore[misc]
+                w = float(self.weight_store.get(expert))  # type: ignore[misc]
+                m_exp = max(0.2, min(10.0, w)) ** 0.5
             except Exception:
-                w_exp = 1.0
+                m_exp = 1.0
         except Exception:
-            w_exp = 1.0
+            m_exp = 1.0
 
+        # Regime (weaker impact)
         if regime:
             try:
-                w_reg = float(self.weight_store.get("regime", str(regime), 1.0))
+                if hasattr(self.weight_store, "multiplier"):
+                    m_reg = float(self.weight_store.multiplier("regime", str(regime), 1.0, power=0.35))
+                else:
+                    w = float(self.weight_store.get("regime", str(regime), 1.0))
+                    m_reg = max(0.2, min(10.0, w)) ** 0.35
             except Exception:
-                w_reg = 1.0
+                m_reg = 1.0
 
-        return w_exp * w_reg
+        return float(m_exp * m_reg)
 
     def _apply_weight(self, decision: ExpertDecision, regime: Optional[str]) -> float:
         base = float(getattr(decision, "score", 0.0))
         expert = str(getattr(decision, "expert", "UNKNOWN_EXPERT"))
-        return base * self._weight_multiplier(expert, regime)
+        return float(base) * self._safe_multiplier(expert, regime)
 
     def _force(self, candidate: ExpertDecision, regime: Optional[str], reason: str) -> ExpertDecision:
         forced_score = float(min(self._apply_weight(candidate, regime), 0.55))
@@ -131,8 +132,8 @@ class ExpertGate:
 
         regime: Optional[str] = None
         try:
-            if isinstance(context, dict):
-                regime = str(context.get("regime")) if context.get("regime") is not None else None
+            if isinstance(context, dict) and context.get("regime") is not None:
+                regime = str(context.get("regime"))
         except Exception:
             regime = None
 
@@ -155,6 +156,5 @@ class ExpertGate:
             candidate = max(decisions, key=lambda d: self._apply_weight(d, regime))
             return self._force(candidate, regime, reason="safe_exploration_kickstart"), decisions
 
-        # default deny: still return "best" for logging
         best = max(decisions, key=lambda d: self._apply_weight(d, regime))
         return best, decisions
