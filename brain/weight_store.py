@@ -1,131 +1,120 @@
 # brain/weight_store.py
 from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple
 import json
 import os
 
-
 @dataclass
 class WeightCfg:
-    # learning rate (EMA)
-    alpha: float = 0.15
-    # clamp to keep stable
-    w_min: float = 0.20
-    w_max: float = 5.00
-    # default initial weight
-    w0: float = 1.0
+    lr: float = 0.05          # learning rate
+    decay: float = 0.0005     # per update decay
+    min_w: float = 0.2
+    max_w: float = 10.0
+    reward_clip: float = 1.0  # clip reward magnitude
 
 
 class WeightStore:
     """
-    Store per-expert weight (optionally per-regime) and update with reward (EMA).
-
-    Backward-compatible:
-      - get(expert_name) still works.
-      - get(expert_name, regime) also works.
-
-    Persistence:
-      - load_json(path), save_json(path)
+    Stores weights by (bucket -> key -> weight)
+    Example:
+      bucket="trend", key="up"
+      bucket="pattern", key="engulf"
+      bucket="expert", key="MEAN_REVERT"
+      bucket="regime", key="trend_up" (optional)
     """
 
-    def __init__(self, cfg: WeightCfg | None = None, path: str | None = None):
-        self.cfg = cfg or WeightCfg()
-        self._w: Dict[str, float] = {}
+    def __init__(self, path: Optional[str] = None, cfg: Optional[WeightCfg] = None) -> None:
         self.path = path
+        self.cfg = cfg or WeightCfg()
+        self._w: Dict[str, Dict[str, float]] = {}
+        if self.path:
+            self.load(self.path)
 
-    # ---------- keying ----------
-    @staticmethod
-    def _key(expert_name: str, regime: Optional[str] = None) -> str:
-        # Prefer regime-specific weights if provided
-        if regime:
-            return f"{regime}::{expert_name}"
-        return expert_name
-
-    # ---------- basic ops ----------
-    def get(self, expert_name: str, regime: Optional[str] = None) -> float:
-        k = self._key(expert_name, regime)
-        return float(self._w.get(k, self.cfg.w0))
-
-    def set(self, expert_name: str, w: float, regime: Optional[str] = None) -> None:
-        k = self._key(expert_name, regime)
-        w = float(w)
-        if w < self.cfg.w_min:
-            w = self.cfg.w_min
-        elif w > self.cfg.w_max:
-            w = self.cfg.w_max
-        self._w[k] = w
-
-    def update(self, expert_name: str, reward: float, regime: Optional[str] = None) -> float:
-        """
-        EMA update: w <- clamp( w*(1-alpha) + f(reward)*alpha )
-        where f(reward) = 1 + reward (small-signal).
-        """
-        w = self.get(expert_name, regime)
-        target = 1.0 + float(reward)
-        new_w = (1.0 - self.cfg.alpha) * w + self.cfg.alpha * target
-        self.set(expert_name, new_w, regime=regime)
-        return self.get(expert_name, regime)
-
-    # ---------- reward helpers ----------
-    @staticmethod
-    def reward_from_outcome(win: Optional[bool], pnl: Optional[float]) -> float:
-        """
-        Safe small-signal reward:
-          - win => +0.10, loss => -0.10
-          - add tiny pnl contribution (clamped)
-        """
-        base = 0.0
-        if win is True:
-            base += 0.10
-        elif win is False:
-            base -= 0.10
-
-        if pnl is not None:
-            # pnl contribution is small & clamped for stability
-            p = float(pnl)
-            if p > 0:
-                base += min(p, 10.0) / 100.0  # + up to +0.10
-            elif p < 0:
-                base -= min(abs(p), 10.0) / 100.0  # - up to -0.10
-        return base
-
-    def update_from_outcome(
-        self,
-        expert_name: str,
-        win: Optional[bool],
-        pnl: Optional[float],
-        regime: Optional[str] = None,
-    ) -> float:
-        reward = self.reward_from_outcome(win, pnl)
-        return self.update(expert_name, reward, regime=regime)
-
-    # ---------- persistence ----------
-    def to_dict(self) -> Dict[str, float]:
-        return dict(self._w)
-
-    def load_dict(self, d: Dict[str, Any]) -> None:
-        self._w = {str(k): float(v) for k, v in (d or {}).items()}
-
-    def load_json(self, path: str | None = None) -> None:
-        p = path or self.path
-        if not p:
+    def load(self, path: str) -> None:
+        if not os.path.exists(path):
+            self._w = {}
             return
-        if not os.path.exists(p):
-            return
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-        # allow either {"weights": {...}} or plain dict
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # accept both old formats
         if isinstance(data, dict) and "weights" in data and isinstance(data["weights"], dict):
-            self.load_dict(data["weights"])
+            self._w = data["weights"]
         elif isinstance(data, dict):
-            self.load_dict(data)
+            self._w = data
+        else:
+            self._w = {}
 
-    def save_json(self, path: str | None = None) -> None:
+    def save(self, path: Optional[str] = None) -> None:
         p = path or self.path
         if not p:
             return
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        payload = {"weights": self._w}
         with open(p, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def get(self, bucket: str, key: str, default: float = 1.0) -> float:
+        return float(self._w.get(bucket, {}).get(key, default))
+
+    def set(self, bucket: str, key: str, value: float) -> None:
+        v = float(value)
+        v = max(self.cfg.min_w, min(self.cfg.max_w, v))
+        self._w.setdefault(bucket, {})[key] = v
+
+    def decay_all(self) -> None:
+        """Small decay towards 1.0 to prevent drifting forever."""
+        d = float(self.cfg.decay)
+        if d <= 0:
+            return
+        for bucket, m in self._w.items():
+            for k, v in list(m.items()):
+                # decay toward 1.0
+                v2 = v + (1.0 - v) * d
+                m[k] = max(self.cfg.min_w, min(self.cfg.max_w, float(v2)))
+
+    def update(self, bucket: str, key: str, reward: float) -> float:
+        """
+        Update weight with clipped reward. Positive reward increases weight, negative decreases.
+        Uses: w <- clamp( (1-decay)*w + lr*reward )
+        """
+        r = float(reward)
+        rc = float(self.cfg.reward_clip)
+        if rc > 0:
+            r = max(-rc, min(rc, r))
+
+        w = self.get(bucket, key, default=1.0)
+
+        # apply light decay toward 1.0 first
+        d = float(self.cfg.decay)
+        if d > 0:
+            w = w + (1.0 - w) * d
+
+        lr = float(self.cfg.lr)
+        w2 = w + lr * r
+
+        w2 = max(self.cfg.min_w, min(self.cfg.max_w, float(w2)))
+        self._w.setdefault(bucket, {})[key] = w2
+        return w2
+
+    @staticmethod
+    def outcome_reward(win: bool, pnl: float) -> float:
+        """
+        Reward shape: win gives +, loss gives -, pnl adds small magnitude (clipped outside).
+        Keep simple & stable.
+        """
+        base = 0.6 if win else -0.6
+        # pnl scale: small contribution
+        p = float(pnl)
+        if p > 0:
+            base += min(0.4, p / 10.0)
+        elif p < 0:
+            base -= min(0.4, abs(p) / 10.0)
+        return base
+        
+    # --- backward compatible aliases (older callers use load_json/save_json) ---
+    def load_json(self, path: str) -> None:
+        self.load(path)
+
+    def save_json(self, path: str) -> None:
+        self.save(path)

@@ -82,37 +82,24 @@ class OutcomeUpdater:
         except Exception:
             pass
 
-        # Weight learning (optional)
+       # observer/outcome_updater.py (trong đoạn xử lý outcome)
         if self.weight_store is not None:
-            expert, regime = self._extract_expert_regime(outcome)
-            if expert:
-                win = outcome.get("win")
-                pnl = outcome.get("pnl")
+            try:
+                expert = (payload.get("expert") or payload.get("risk", {}).get("expert") or "UNKNOWN_EXPERT")
+                regime = (payload.get("regime") or payload.get("risk", {}).get("regime") or "UNKNOWN")
 
-                # Normalize types
-                if isinstance(win, str):
-                    if win.lower() in ("true", "1", "yes", "y"):
-                        win = True
-                    elif win.lower() in ("false", "0", "no", "n"):
-                        win = False
-                    else:
-                        win = None
+                win = bool(payload.get("win", False))
+                pnl = float(payload.get("pnl", 0.0))
 
-                try:
-                    pnl_f = float(pnl) if pnl is not None else None
-                except Exception:
-                    pnl_f = None
+                r = self.weight_store.outcome_reward(win=win, pnl=pnl)
 
-                try:
-                    new_w = self.weight_store.update_from_outcome(expert, win=win, pnl=pnl_f, regime=regime)
-                    # Attach to outcome for logging/journal downstream (non-breaking)
-                    meta = outcome.get("meta")
-                    if not isinstance(meta, dict):
-                        meta = {}
-                        outcome["meta"] = meta
-                    meta["weight_after"] = float(new_w)
+                # 1) update theo expert
+                self.weight_store.update("expert", str(expert), r)
 
-                    if self.autosave and (self.weights_path or getattr(self.weight_store, "path", None)):
-                        self.weight_store.save_json(self.weights_path)
-                except Exception:
-                    pass
+                # 2) optional: update theo regime (nhẹ hơn, có thể giảm reward)
+                self.weight_store.update("regime", str(regime), 0.3 * r)
+
+                # periodic save
+                self.weight_store.save()
+            except Exception:
+                pass
