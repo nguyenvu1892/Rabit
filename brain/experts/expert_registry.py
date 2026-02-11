@@ -45,3 +45,11 @@ class ExpertRegistry:
     def get_all(self):
         # Backward compatible helper used by ExpertGate
         return list(self._experts.values())
+
+    def build_default_registry() -> "ExpertRegistry":
+        from brain.experts.experts_basic import TrendMAExpert, MeanRevertExpert, BreakoutExpert
+        reg = ExpertRegistry()
+        reg.register(TrendMAExpert())
+        reg.register(MeanRevertExpert())
+        reg.register(BreakoutExpert())
+        return reg

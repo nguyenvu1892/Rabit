@@ -61,11 +61,8 @@ class DecisionEngine:
         # IMPORTANT: gate must exist right after init
         # Match current ExpertGate signature in repo: (registry, epsilon, epsilon_cooldown, rng, weight_store, soft_threshold)
         self.gate = ExpertGate(
-            registry=self.registry,
-            epsilon=0.0,
-            epsilon_cooldown=0,
-            rng=self._rng,
-            weight_store=self.weight_store,
+                    registry=self.registry,
+                    weight_store=self.weight_store,
         )
 
         # --- meta layer (optional, do not pass enabled=...) ---
