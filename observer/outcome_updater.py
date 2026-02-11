@@ -1,12 +1,13 @@
 # observer/outcome_updater.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Any
 
 from brain.reinforcement_learner import ReinforcementLearner
 from brain.trade_memory import TradeMemory
 from brain.weight_store import WeightStore
-
+if TYPE_CHECKING:
+    from brain.weight_store import WeightStore
 
 class OutcomeUpdater:
     """

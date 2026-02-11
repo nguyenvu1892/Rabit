@@ -24,7 +24,8 @@ class ReinforcementLearner:
             or outcome.get("expert")
             or "UNKNOWN_EXPERT"
         )
-        self.weights.update(str(expert), float(reward))
+        self.weights.update("expert", str(expert), float(reward))
+
 
     def learn(self, snapshot: Dict[str, Any], outcome: Dict[str, Any], reward: float = 0.0) -> None:
         self.update(snapshot, outcome, float(reward))
