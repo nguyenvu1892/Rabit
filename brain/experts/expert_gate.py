@@ -158,3 +158,55 @@ class ExpertGate:
 
         best = max(decisions, key=lambda d: self._apply_weight(d, regime))
         return best, decisions
+
+    def _extract_tag(context: dict, key: str) -> str:
+        v = context.get(key)
+        if v is None:
+            return ""
+        # allow nested dict {"pattern":{"name":"Engulf"}} or {"pattern":"Engulf"}
+        if isinstance(v, dict):
+            for k in ("name", "id", "value", "tag"):
+                if k in v and v[k] is not None:
+                    return str(v[k])
+            return ""
+        return str(v)
+
+
+    def _smart_multiplier(weight_store, context: dict, expert: str, regime: str) -> float:
+        """
+        Multiply multiple buckets:
+        expert[expert] *
+        regime:{regime}[expert] *
+        session[session] *
+        pattern[pattern] *
+        structure[structure] *
+        trend[trend]
+        """
+        if weight_store is None:
+            return 1.0
+
+        m = 1.0
+
+        # main expert weight
+        try:
+            m *= float(weight_store.multiplier("expert", expert, default=1.0, power=1.0))
+        except Exception:
+            pass
+
+        # regime-specific expert multiplier
+        if regime:
+            try:
+                m *= float(weight_store.multiplier(f"regime:{regime}", expert, default=1.0, power=0.7))
+            except Exception:
+                pass
+
+        # tag multipliers (weaker power)
+        for bucket, pwr in (("session", 0.35), ("pattern", 0.35), ("structure", 0.35), ("trend", 0.35)):
+            tag = _extract_tag(context, bucket)
+            if tag:
+                try:
+                    m *= float(weight_store.multiplier(bucket, tag, default=1.0, power=pwr))
+                except Exception:
+                    pass
+
+        return float(m)
