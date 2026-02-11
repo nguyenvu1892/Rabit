@@ -1,5 +1,8 @@
+# brain/experts/experts_basic.py
 from __future__ import annotations
+
 from typing import Any, Dict, List
+
 from brain.experts.expert_base import BaseExpert, ExpertDecision
 
 
@@ -7,7 +10,7 @@ class TrendMAExpert(BaseExpert):
     name = "TREND_MA"
 
     def evaluate(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
-        candles: List[Dict[str, Any]] = trade_features["candles"]
+        candles: List[Dict[str, Any]] = trade_features.get("candles") or trade_features.get("window") or []
         if len(candles) < 50:
             return ExpertDecision(False, 0.0, self.name, {"reason": "not_enough_data"})
 
@@ -15,28 +18,27 @@ class TrendMAExpert(BaseExpert):
         ma_fast = sum(closes[-10:]) / 10.0
         ma_slow = sum(closes) / 50.0
 
-        score = 0.0
-        allow = False
         if ma_fast > ma_slow:
-            score = 0.65
-            allow = True
+            score, allow = 0.65, True
         else:
-            score = 0.35
-            allow = False
+            score, allow = 0.35, False
 
-        # context bonus
         if context.get("regime") == "trend":
             score += 0.15
 
-        return ExpertDecision(allow=allow, score=min(score, 1.0), expert=self.name,
-                             meta={"ma_fast": ma_fast, "ma_slow": ma_slow, "regime": context.get("regime")})
+        return ExpertDecision(
+            allow=allow,
+            score=min(score, 1.0),
+            expert=self.name,
+            meta={"ma_fast": ma_fast, "ma_slow": ma_slow, "regime": context.get("regime")},
+        )
 
 
 class MeanRevertExpert(BaseExpert):
     name = "MEAN_REVERT"
 
     def evaluate(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
-        candles: List[Dict[str, Any]] = trade_features["candles"]
+        candles: List[Dict[str, Any]] = trade_features.get("candles") or trade_features.get("window") or []
         if len(candles) < 60:
             return ExpertDecision(False, 0.0, self.name, {"reason": "not_enough_data"})
 
@@ -45,24 +47,23 @@ class MeanRevertExpert(BaseExpert):
         last = closes[-1]
         dist = abs(last - mean)
 
-        # range regime ưu tiên mean reversion
-        base = 0.40
-        if context.get("regime") == "range":
-            base = 0.65
-
-        # càng xa mean score càng cao
+        base = 0.65 if context.get("regime") == "range" else 0.40
         score = min(1.0, base + (dist / 10.0))
         allow = score >= 0.7
 
-        return ExpertDecision(allow=allow, score=score, expert=self.name,
-                             meta={"mean": mean, "last": last, "dist": dist, "regime": context.get("regime")})
+        return ExpertDecision(
+            allow=allow,
+            score=score,
+            expert=self.name,
+            meta={"mean": mean, "last": last, "dist": dist, "regime": context.get("regime")},
+        )
 
 
 class BreakoutExpert(BaseExpert):
     name = "BREAKOUT"
 
     def evaluate(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
-        candles: List[Dict[str, Any]] = trade_features["candles"]
+        candles: List[Dict[str, Any]] = trade_features.get("candles") or trade_features.get("window") or []
         if len(candles) < 40:
             return ExpertDecision(False, 0.0, self.name, {"reason": "not_enough_data"})
 
@@ -77,10 +78,37 @@ class BreakoutExpert(BaseExpert):
         score = 0.2
         if broke_up or broke_dn:
             score = 0.75
-
-        if context.get("regime") == "breakout":
-            score += 0.15
+            if context.get("regime") == "breakout":
+                score += 0.15
 
         allow = score >= 0.8
-        return ExpertDecision(allow=allow, score=min(score, 1.0), expert=self.name,
-                             meta={"hi": hi, "lo": lo, "last": last, "regime": context.get("regime")})
+        return ExpertDecision(
+            allow=allow,
+            score=min(score, 1.0),
+            expert=self.name,
+            meta={"hi": hi, "lo": lo, "last": last, "regime": context.get("regime")},
+        )
+
+
+def register_basic_experts(registry: Any) -> None:
+    """
+    DecisionEngine expects this function.
+    Registry implementations differ, so we support common method names.
+    """
+    experts = [TrendMAExpert(), MeanRevertExpert(), BreakoutExpert()]
+
+    if hasattr(registry, "register"):
+        for e in experts:
+            registry.register(e)
+        return
+
+    # fallback: some registries use add()
+    if hasattr(registry, "add"):
+        for e in experts:
+            registry.add(e)
+        return
+
+    # last resort: store on a known attribute
+    if not hasattr(registry, "_experts"):
+        setattr(registry, "_experts", [])
+    registry._experts.extend(experts)

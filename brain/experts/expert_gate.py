@@ -2,162 +2,152 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from brain.experts.expert_base import ExpertDecision
-from brain.experts.expert_registry import ExpertRegistry
+from .expert_base import ExpertDecision, coerce_decision
+
+if TYPE_CHECKING:
+    from .expert_registry import ExpertRegistry
 
 
 class ExpertGate:
     """
-    5.0.8.9: Expert–Regime pair intelligence
-      - score is adjusted by weight_store.get(expert, regime)
-      - exploration: can force "near-miss" decision with cooldown
+    Chooses an expert decision from ExpertRegistry.
+    Supports exploration (epsilon) and weight adjustment via WeightStore.
+
+    WeightStore compatibility:
+      - get(expert_name) -> float
+      - OR get(expert_name, regime) -> float
     """
 
     def __init__(
         self,
-        registry: ExpertRegistry,
-        epsilon: float = 0.0,
+        registry: "ExpertRegistry",
+        weight_store: Any = None,
+        epsilon: float = 0.05,
         epsilon_cooldown: int = 0,
-        rng: Optional[random.Random] = None,
-        weight_store: Optional[Any] = None,
+        soft_threshold: float = 0.0,
+        seed: Optional[int] = None,
     ) -> None:
         self.registry = registry
+        self.weight_store = weight_store
         self.epsilon = float(epsilon)
         self.epsilon_cooldown = int(epsilon_cooldown)
+        self.soft_threshold = float(soft_threshold)
+
+        self._rng = random.Random(seed)
         self._cooldown_left = 0
-        self.rng = rng or random.Random()
-        self.soft_threshold = 1.0001
-        self.weight_store = weight_store
 
-    def tick(self) -> None:
-        if self._cooldown_left > 0:
-            self._cooldown_left -= 1
-
-    def set_epsilon(self, eps: float) -> None:
-        self.epsilon = float(eps)
-
-    def set_weight_store(self, ws: Any) -> None:
-        self.weight_store = ws
-
-    def should_explore(self) -> bool:
-        return self._should_explore()
+    def set_epsilon(self, epsilon: float, cooldown: Optional[int] = None) -> None:
+        self.epsilon = float(epsilon)
+        if cooldown is not None:
+            self.epsilon_cooldown = int(cooldown)
 
     def _should_explore(self) -> bool:
         if self.epsilon <= 0:
             return False
         if self._cooldown_left > 0:
+            self._cooldown_left -= 1
             return False
-        return self.rng.random() < self.epsilon
+        if self._rng.random() < self.epsilon:
+            self._cooldown_left = max(0, int(self.epsilon_cooldown))
+            return True
+        return False
 
-    def pick(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> Tuple[ExpertDecision, List[ExpertDecision]]:
-        experts = self._iter_experts()
+    def _get_weight(self, expert_name: str, regime: Optional[str]) -> float:
+        ws = self.weight_store
+        if ws is None:
+            return 1.0
 
-        if not experts:
-            return self._fallback_decision_no_expert(trade_features, context)
-        decisions: List[ExpertDecision] = []
-        for exp in experts:
+        # try pair weight first (expert, regime)
+        if regime is not None:
             try:
-                d = exp.decide(trade_features, context)
-                if d is None:
-                    continue
-                if getattr(d, "expert", None) in (None, "", "UNKNOWN_EXPERT"):
-                    try:
-                        d.expert = getattr(exp, "name", None) or exp.__class__.__name__
-                    except Exception:
-                        pass
-                decisions.append(d)
+                w = ws.get(expert_name, regime)
+                return float(w)
+            except TypeError:
+                pass
+            except Exception:
+                pass
+
+        # fallback single-key weight (expert)
+        try:
+            w = ws.get(expert_name)
+            return float(w)
+        except Exception:
+            return 1.0
+
+    def pick(
+        self,
+        trade_features: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Tuple[ExpertDecision, List[ExpertDecision]]:
+        """
+        Returns:
+          - best_decision: ExpertDecision
+          - all_decisions: List[ExpertDecision]  (raw per expert)
+        """
+        experts = self.registry.get_all()
+        if not experts:
+            best = ExpertDecision(
+                allow=False,
+                score=0.0,
+                expert="NO_EXPERT",
+                meta={"reason": "registry empty"},
+            )
+            return best, [best]
+
+        regime = None
+        try:
+            regime = context.get("regime")
+        except Exception:
+            regime = None
+
+        all_decisions: List[ExpertDecision] = []
+        scored: List[Tuple[float, ExpertDecision]] = []
+
+        for exp in experts:
+            name = getattr(exp, "name", exp.__class__.__name__)
+            try:
+                raw = exp.decide(trade_features, context)
+                dec = coerce_decision(raw, fallback_expert=str(name))
             except Exception as e:
-                # don't silently swallow; keep a trace decision for debugging
-                decisions.append(
-                    ExpertDecision(
-                        expert=getattr(exp, "name", None) or exp.__class__.__name__,
-                        allow=False,
-                        score=0.0,
-                        meta={"error": "decide_exception", "exc": repr(e)},
-                    )
+                dec = ExpertDecision(
+                    allow=False,
+                    score=0.0,
+                    expert=str(name),
+                    meta={"error": repr(e)},
                 )
 
-        # If all failed/none, return a deterministic deny with meta
-        if not decisions:
-            dummy = ExpertDecision(expert="NO_DECISIONS", allow=False, score=0.0, meta={"reason": "all_none"})
-            return dummy, []
+            all_decisions.append(dec)
 
-        regime = str(context.get("regime", "UNKNOWN"))
+            w = self._get_weight(dec.expert, regime)
+            adj = float(dec.score) * float(w)
+            # keep weight inside meta for debugging
+            dec.meta = dict(dec.meta or {})
+            dec.meta.setdefault("weight", float(w))
+            dec.meta.setdefault("adj_score", float(adj))
 
-        def _adj_score(d: ExpertDecision) -> float:
-            base = float(getattr(d, "score", 0.0))
-            w = 1.0
-            if self.weight_store is not None:
-                try:
-                    w = float(self.weight_store.get(str(getattr(d, "expert", "")), regime, 1.0))
-                except Exception:
-                    w = 1.0
-            return base * w
+            scored.append((adj, dec))
 
-        allow_decisions = [d for d in decisions if bool(getattr(d, "allow", False))]
-        best = max(allow_decisions, key=_adj_score) if allow_decisions else max(decisions, key=_adj_score)
+        # Exploration: pick random among candidates (prefer allow if any)
+        if self._should_explore():
+            allow_candidates = [d for d in all_decisions if d.allow]
+            chosen = self._rng.choice(allow_candidates or all_decisions)
+            return chosen, all_decisions
 
-        best_adj = _adj_score(best)
+        # Exploitation: choose best adjusted score (prefer allow if soft_threshold requires)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_adj, best_dec = scored[0]
 
-        # attach debug meta
-        try:
-            if getattr(best, "meta", None) is None:
-                best.meta = {}
-            w_best = 1.0
-            if self.weight_store is not None:
-                try:
-                    w_best = float(self.weight_store.get(str(getattr(best, "expert", "")), regime, 1.0))
-                except Exception:
-                    w_best = 1.0
-            best.meta["weight"] = w_best
-            best.meta["score_adj"] = best_adj
-        except Exception:
-            pass
+        # Optional: if best is not allow and you want "soft threshold" to force explore/deny,
+        # keep it simple: only allow if it passes threshold.
+        if self.soft_threshold > 0 and best_adj < self.soft_threshold:
+            # below threshold -> deny
+            best_dec = ExpertDecision(
+                allow=False,
+                score=float(best_dec.score),
+                expert=str(best_dec.expert),
+                meta={**(best_dec.meta or {}), "reason": "below_soft_threshold"},
+            )
 
-        # exploration: if best is near-miss and we explore, allow it forcibly
-        if best_adj < self.soft_threshold and self._should_explore():
-            sorted_by_adj = sorted(decisions, key=_adj_score, reverse=True)
-            pick2 = None
-            for d in sorted_by_adj:
-                if d is best:
-                    continue
-                pick2 = d
-                break
-
-            if pick2 is not None:
-                try:
-                    pick2.allow = True
-                    if getattr(pick2, "meta", None) is None:
-                        pick2.meta = {}
-                    pick2.meta["forced"] = True
-                    pick2.meta["forced_reason"] = "epsilon_explore_near_miss"
-                except Exception:
-                    pass
-
-                self._cooldown_left = int(self.epsilon_cooldown)
-                return pick2, decisions
-
-        def _iter_experts(self):
-            if self.registry is None:
-                return []
-            for name in ("get_all", "all", "list_all"):
-                fn = getattr(self.registry, name, None)
-                if callable(fn):
-                    try:
-                        xs = fn()
-                        return list(xs) if xs is not None else []
-                    except Exception:
-                        pass
-
-            for attr in ("experts", "_experts"):
-                d = getattr(self.registry, attr, None)
-                if isinstance(d, dict):
-                    return list(d.values())
-                if isinstance(d, list):
-                    return d
-
-            return []
-
-        return best, decisions
+        return best_dec, all_decisions
