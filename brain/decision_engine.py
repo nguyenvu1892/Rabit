@@ -1,140 +1,235 @@
 # brain/decision_engine.py
 from __future__ import annotations
 
-import random
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-from brain.context_memory import ContextMemory
-from brain.context_intelligence import ContextIntelligence
-from brain.risk_engine import RiskEngine
-from brain.trade_memory import TradeMemory
-from brain.weight_store import WeightStore
 from brain.regime_detector import detect_regime
 
-from brain.experts.expert_registry import ExpertRegistry
-from brain.experts.expert_gate import ExpertGate
-from brain.experts.experts_basic import TrendMAExpert, MeanRevertExpert, BreakoutExpert
+# NOTE:
+# - Avoid circular imports: keep these imports local when needed.
+# - DecisionEngine must work even if meta layer is absent / optional.
 
-# Meta layer is optional; do NOT break old runs if meta is unstable/missing
-try:
-    from brain.meta_controller import MetaController  # type: ignore
-except Exception:  # pragma: no cover
-    MetaController = None  # type: ignore
+
+@dataclass
+class EngineDecision:
+    allow: bool
+    score: float
+    expert: str = "UNKNOWN_EXPERT"
+    meta: Optional[Dict[str, Any]] = None
 
 
 class DecisionEngine:
+    """
+    Coordinates:
+    - Regime detection
+    - ExpertGate picking (uses WeightStore if provided)
+    - (Optional) MetaController hooks
+    """
+
     def __init__(
         self,
-        context_memory: Optional[ContextMemory] = None,
-        context_intel: Optional[ContextIntelligence] = None,
-        risk_engine: Optional[RiskEngine] = None,
-        trade_memory: Optional[TradeMemory] = None,
-        weight_store: Optional[WeightStore] = None,
-        seed: Optional[int] = None,
-        allow_threshold: float = 0.0,
+        risk_engine: Any,
+        weight_store: Optional[Any] = None,
         meta_controller: Optional[Any] = None,
-        meta_enabled: bool = False,
+        enable_meta: bool = True,
+        *,
+        epsilon: float = 0.0,
+        epsilon_cooldown: int = 0,
+        seed: Optional[int] = None,
     ) -> None:
-        # --- core components (keep old behavior) ---
-        self.context_memory = context_memory if context_memory is not None else ContextMemory()
-        self.context_intel = context_intel if context_intel is not None else ContextIntelligence(self.context_memory)
-        self.risk_engine = risk_engine if risk_engine is not None else RiskEngine()
-        self.trade_memory = trade_memory if trade_memory is not None else TradeMemory()
+        self.risk_engine = risk_engine
+        self.weight_store = weight_store
 
-        # --- weights ---
-        self.weight_store = weight_store if weight_store is not None else WeightStore()
-
-        # --- backwards-compat ---
-        self.allow_threshold = float(allow_threshold)
-
-        # --- exploration controls (ShadowRunner drives these per-step) ---
-        self._rng = random.Random(seed) if seed is not None else random.Random()
-        self.epsilon = 0.0
-        self.epsilon_cooldown = 0
-
-        # --- expert registry / gate ---
-        self.registry = ExpertRegistry()
-        self.registry.register(TrendMAExpert())
-        self.registry.register(MeanRevertExpert())
-        self.registry.register(BreakoutExpert())
-
-        # IMPORTANT: gate must exist right after init
-        # Match current ExpertGate signature in repo: (registry, epsilon, epsilon_cooldown, rng, weight_store, soft_threshold)
-        self.gate = ExpertGate(
-                    registry=self.registry,
-                    weight_store=self.weight_store,
+        # --- gate / registry ---
+        self.registry = self._build_registry()
+        self.gate = self._build_gate(
+            registry=self.registry,
+            weight_store=self.weight_store,
+            epsilon=epsilon,
+            epsilon_cooldown=epsilon_cooldown,
+            seed=seed,
         )
 
-        # --- meta layer (optional, do not pass enabled=...) ---
-        self.meta_enabled = bool(meta_enabled)
-        self.meta = meta_controller
-        if self.meta is None and self.meta_enabled and MetaController is not None:
-            # keep minimal wiring, don't break if meta expects a mapping later
+        # --- meta (optional) ---
+        self.meta = None
+        if enable_meta:
+            self.meta = self._build_meta(meta_controller)
+
+    # -------------------------
+    # Builders (robust)
+    # -------------------------
+    def _build_registry(self) -> Any:
+        """
+        Create ExpertRegistry and register experts.
+        Keep imports local to avoid circular dependencies.
+        """
+        from brain.experts.expert_registry import ExpertRegistry
+
+        reg = ExpertRegistry()
+
+        # Register basic experts if available
+        try:
+            from brain.experts.experts_basic import register_basic_experts  # type: ignore
+
+            register_basic_experts(reg)
+        except Exception:
+            # Fallback: try importing module side-effects
             try:
-                self.meta = MetaController(store=self.weight_store)
+                import brain.experts.experts_basic  # noqa: F401
             except Exception:
-                self.meta = None
-                self.meta_enabled = False
+                pass
 
-        # optional tracking (safe)
-        self._last_intent_id: Optional[str] = None
+        # Register simple experts if available
+        try:
+            from brain.experts.simple_experts import register_simple_experts  # type: ignore
 
+            register_simple_experts(reg)
+        except Exception:
+            try:
+                import brain.experts.simple_experts  # noqa: F401
+            except Exception:
+                pass
+
+        return reg
+
+    def _build_gate(
+        self,
+        registry: Any,
+        weight_store: Optional[Any],
+        epsilon: float,
+        epsilon_cooldown: int,
+        seed: Optional[int],
+    ) -> Any:
+        from brain.experts.expert_gate import ExpertGate
+
+        # Some versions accept rng, some accept seed, some accept weight_store.
+        kwargs: Dict[str, Any] = {
+            "registry": registry,
+            "epsilon": float(epsilon),
+            "epsilon_cooldown": int(epsilon_cooldown),
+        }
+        if weight_store is not None:
+            kwargs["weight_store"] = weight_store
+
+        # RNG/seed compatibility
+        if seed is not None:
+            try:
+                import random
+
+                kwargs["rng"] = random.Random(int(seed))
+            except Exception:
+                pass
+
+        try:
+            return ExpertGate(**kwargs)
+        except TypeError:
+            # fallback: remove unknown keys one by one
+            for k in ["weight_store", "rng", "epsilon_cooldown"]:
+                if k in kwargs:
+                    tmp = dict(kwargs)
+                    tmp.pop(k, None)
+                    try:
+                        return ExpertGate(**tmp)
+                    except TypeError:
+                        continue
+            # last resort
+            return ExpertGate(registry=registry)
+
+    def _build_meta(self, meta_controller: Optional[Any]) -> Optional[Any]:
+        if meta_controller is not None:
+            return meta_controller
+
+        # Try auto-create MetaController if module exists
+        try:
+            from brain.meta_controller import MetaController  # type: ignore
+
+            try:
+                return MetaController()
+            except TypeError:
+                # some versions might require args; disable if cannot instantiate
+                return None
+        except Exception:
+            return None
+
+    # -------------------------
+    # Exploration control
+    # -------------------------
     def set_exploration(self, epsilon: float, cooldown: int = 0) -> None:
         """
-        Called by ShadowRunner every step (epsilon may change over time).
-        ShadowRunner uses keyword 'cooldown', so keep this signature.
+        Called by ShadowRunner periodically.
         """
+        # keep on engine (useful for logging/debug)
         self.epsilon = float(epsilon)
         self.epsilon_cooldown = int(cooldown)
 
-        # keep gate synced
-        if hasattr(self, "gate") and self.gate is not None:
+        # pass-through to gate if available
+        if hasattr(self.gate, "set_epsilon"):
             try:
-                self.gate.set_epsilon(self.epsilon)
-            except Exception:
-                pass
-            # some versions store epsilon_cooldown as attribute
-            try:
-                setattr(self.gate, "epsilon_cooldown", self.epsilon_cooldown)
+                self.gate.set_epsilon(float(epsilon))
             except Exception:
                 pass
 
+        # some gate versions expose epsilon_cooldown directly
+        try:
+            if hasattr(self.gate, "epsilon_cooldown"):
+                setattr(self.gate, "epsilon_cooldown", int(cooldown))
+        except Exception:
+            pass
+
+        # some gate versions have tick/cooldown internal
+        # (ShadowRunner should call gate.tick() each step if it exists)
+
+    # -------------------------
+    # Core evaluation
+    # -------------------------
     def evaluate_trade(self, trade_features: Dict[str, Any]) -> Tuple[bool, float, Dict[str, Any]]:
         """
         Return: (allow, score, risk_cfg)
-        trade_features expected at least: "candles" or "window"
         """
-        candles = trade_features.get("candles") or trade_features.get("window") or []
-        context = detect_regime(candles)
+        candles: List[Any] = trade_features.get("candles") or trade_features.get("window") or []
+        context: Dict[str, Any] = detect_regime(candles) if candles is not None else {"regime": "UNKNOWN"}
 
-        # ensure gate exists (defensive)
-        if not hasattr(self, "gate") or self.gate is None:
-            # fail-safe: deny, don't crash runner
-            return False, 0.0, {"error": "gate_missing"}
+        # Meta pre-hook (optional)
+        if self.meta is not None and hasattr(self.meta, "pre_decision"):
+            try:
+                self.meta.pre_decision(trade_features=trade_features, context=context)
+            except Exception:
+                pass
 
-        # propagate epsilon to gate per-step
-        try:
-            self.gate.set_epsilon(self.epsilon)
-        except Exception:
-            pass
+        best, all_decisions = self.gate.pick(trade_features, context)
 
-        best, _all_decisions = self.gate.pick(trade_features, context)
+        # Normalize best decision shape
+        if isinstance(best, dict):
+            allow = bool(best.get("allow", False))
+            score = float(best.get("score", 0.0))
+            expert_name = str(best.get("expert", "UNKNOWN_EXPERT"))
+            meta = best.get("meta") if isinstance(best.get("meta"), dict) else None
+        else:
+            allow = bool(getattr(best, "allow", False))
+            score = float(getattr(best, "score", 0.0))
+            expert_name = str(getattr(best, "expert", "UNKNOWN_EXPERT"))
+            meta = getattr(best, "meta", None)
+            if meta is not None and not isinstance(meta, dict):
+                meta = None
 
-        allow = bool(getattr(best, "allow", False))
-        score = float(getattr(best, "score", 0.0))
-        expert = str(getattr(best, "expert", "UNKNOWN_EXPERT"))
-        meta = getattr(best, "meta", None) or {}
-
-        # attach weight snapshot if available (does not break anything)
-        try:
-            meta.setdefault("weight", float(self.weight_store.get(expert)))
-        except Exception:
-            pass
-
+        # Build risk cfg
         risk_cfg: Dict[str, Any] = {
-            "expert": expert,
-            "regime": context.get("regime", "UNKNOWN") if isinstance(context, dict) else "UNKNOWN",
-            "meta": meta,
+            "expert": expert_name,
+            "regime": context.get("regime", "UNKNOWN"),
         }
+        if meta:
+            risk_cfg.update({"meta": meta})
+
+        # Meta post-hook (optional)
+        if self.meta is not None and hasattr(self.meta, "post_decision"):
+            try:
+                self.meta.post_decision(
+                    trade_features=trade_features,
+                    context=context,
+                    decision={"allow": allow, "score": score, "expert": expert_name, "meta": meta},
+                )
+            except Exception:
+                pass
 
         return allow, score, risk_cfg

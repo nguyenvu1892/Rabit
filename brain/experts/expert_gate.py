@@ -96,8 +96,30 @@ class ExpertGate:
             return s * w
 
         # choose best by adjusted score
-        best = max(decisions, key=_adj_score)
+ # ---- choose best (PRIORITIZE allow=True) ----
+        def _adj_score(d):
+            base = float(getattr(d, "score", 0.0))
+            w = 1.0
+            try:
+                if self.weight_store is not None:
+                    w = float(self.weight_store.get(
+                        str(getattr(d, "expert", "")),
+                        str(context.get("regime")),
+                        1.0
+                    ))
+            except Exception:
+                w = 1.0
+            return base * w
+
+        allow_decisions = [d for d in decisions if bool(getattr(d, "allow", False))]
+
+        if allow_decisions:
+            best = max(allow_decisions, key=_adj_score)
+        else:
+            best = max(decisions, key=_adj_score)
+
         best_adj = _adj_score(best)
+
 
         # attach debug meta
         try:
@@ -140,3 +162,4 @@ class ExpertGate:
                 return pick2, decisions
 
         return best, decisions
+

@@ -43,7 +43,6 @@ class ExpertRegistry:
         return len(self._experts)
 
     def get_all(self):
-        # Backward compatible helper used by ExpertGate
         return list(self._experts.values())
 
     def build_default_registry() -> "ExpertRegistry":

@@ -6,11 +6,12 @@ from typing import Any, Dict, Optional, Protocol
 
 @dataclass
 class ExpertDecision:
-    expert: str
-    score: float
-    allow: bool
-    meta: Optional[Dict[str, Any]] = None
-
+    def __init__(self, allow: bool, score: float, expert: str, meta=None):
+        self.allow = allow
+        self.score = score
+        self.expert = expert
+        self.meta = meta or {}
+        
 class ExpertBase(Protocol):
     """
     Backward-compatible base interface for experts.
@@ -24,7 +25,7 @@ class ExpertBase(Protocol):
 
     def decide(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
         raise NotImplementedError
-        
+
 class BaseExpert:
     name: str = "BASE"
 
