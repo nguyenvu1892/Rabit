@@ -1,179 +1,190 @@
-# observer/outcome_updater.py
+# brain/weight_store.py
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-from brain.trade_memory import TradeMemory
-
-if TYPE_CHECKING:
-    from brain.reinforcement_learner import ReinforcementLearner  # chỉ dùng cho type-hint, không import runtime
-try:
-    from brain.weight_store import WeightStore
-except Exception:  # pragma: no cover
-    WeightStore = None  # type: ignore
+import json
+import os
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, List
 
 
-class OutcomeUpdater:
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+@dataclass
+class WeightUpdate:
+    regime: str
+    expert: str
+    old: float
+    new: float
+    delta: float
+    reason: str
+
+
+class WeightStore:
     """
-    Consumes trade outcomes and updates:
-    - ReinforcementLearner (existing behavior)
-    - WeightStore (optional) [5.0.8.1+]
+    Stable, standalone weight store (stdlib-only) to avoid circular imports.
 
-    5.0.8.3 additions:
-    - periodic save (avoid IO each trade)
-    - periodic decay toward 1.0 (anti-overfit)
-    - periodic summary log (top/bottom weights)
+    Layout:
+        self._w[regime][expert] = weight
 
-    5.0.9.2 (B) additions:
-    - forced penalty
-    - volatility/ATR scaling (if atr available)
-    - periodic normalization (mean bucket -> ~1.0)
+    Backward compatible behaviors:
+      - get(expert) works (uses regime="global")
+      - set(expert, value) works (regime="global")
+      - update(expert, delta, ...) works (regime="global")
+      - get(expert, regime) also works
     """
 
     def __init__(
         self,
-        learner: ReinforcementLearner,
-        trade_memory: TradeMemory,
-        weight_store: Optional["WeightStore"] = None,
-        weights_path: Optional[str] = None,
-        autosave: bool = True,
+        init_weight: float = 1.0,
+        min_w: float = 0.2,
+        max_w: float = 5.0,
+        default_regime: str = "global",
     ) -> None:
-        self.learner = learner
-        self.trade_memory = trade_memory
-        self.weight_store = weight_store
-        self.weights_path = weights_path
-        self.autosave = bool(autosave)
+        self.init_weight = float(init_weight)
+        self.min_w = float(min_w)
+        self.max_w = float(max_w)
+        self.default_regime = str(default_regime)
+        self._w: Dict[str, Dict[str, float]] = {}
 
-        # ---- 5.0.8.3 stabilize knobs ----
-        self._outcome_count = 0
-        self.save_every = 200
-        self.decay_every = 200
-        self.decay_rate = 0.001
-        self.log_every = 200
+    # -----------------------------
+    # Core access
+    # -----------------------------
+    def get(self, expert: str, regime: Optional[str] = None, default: Optional[float] = None) -> float:
+        r = self.default_regime if regime is None else str(regime)
+        d = self.init_weight if default is None else float(default)
+        return float(self._w.get(r, {}).get(str(expert), d))
 
-        # ---- 5.0.9.2 knobs ----
-        self.normalize_every = 500
-        self.regime_factor = 0.25  # lighter than expert
-        self.forced_penalty = 0.5  # reduce reward signal on forced trades
+    def set(self, expert: str, value: float, regime: Optional[str] = None) -> None:
+        r = self.default_regime if regime is None else str(regime)
+        e = str(expert)
+        self._w.setdefault(r, {})[e] = _clamp(float(value), self.min_w, self.max_w)
 
-        # Load once if configured
-        if self.weight_store is not None and self.weights_path:
-            try:
-                self.weight_store.path = self.weights_path
-                self.weight_store.load_json(self.weights_path)
-            except Exception:
-                pass
+    def bump(
+        self,
+        expert: str,
+        delta: float,
+        regime: Optional[str] = None,
+        reason: str = "bump",
+    ) -> WeightUpdate:
+        r = self.default_regime if regime is None else str(regime)
+        e = str(expert)
+        old = self.get(e, r)
+        new = _clamp(old + float(delta), self.min_w, self.max_w)
+        self.set(e, new, r)
+        return WeightUpdate(regime=r, expert=e, old=old, new=new, delta=float(delta), reason=reason)
 
-    def _extract_expert_regime(self, outcome: Dict[str, Any]) -> Tuple[str, str]:
-        expert = outcome.get("expert")
-        regime = outcome.get("regime")
+    def mul(
+        self,
+        expert: str,
+        factor: float,
+        regime: Optional[str] = None,
+        reason: str = "mul",
+    ) -> WeightUpdate:
+        r = self.default_regime if regime is None else str(regime)
+        e = str(expert)
+        old = self.get(e, r)
+        new = _clamp(old * float(factor), self.min_w, self.max_w)
+        self.set(e, new, r)
+        return WeightUpdate(regime=r, expert=e, old=old, new=new, delta=new - old, reason=reason)
 
-        if not expert:
-            risk = outcome.get("risk") or {}
-            if isinstance(risk, dict):
-                expert = risk.get("expert") or expert
-                regime = risk.get("regime") or regime
+    # -----------------------------
+    # Stabilizers (5.0.8.3+)
+    # -----------------------------
+    def decay_toward(
+        self,
+        target: float = 1.0,
+        rate: float = 0.01,
+        regime: Optional[str] = None,
+    ) -> None:
+        """
+        Softly decay weights toward target to avoid runaway overfit.
+        w := w + rate * (target - w)
+        """
+        r = self.default_regime if regime is None else str(regime)
+        if r not in self._w:
+            return
+        t = float(target)
+        a = float(rate)
+        for e, w in list(self._w[r].items()):
+            nw = _clamp(w + a * (t - w), self.min_w, self.max_w)
+            self._w[r][e] = nw
 
-        if not expert:
-            meta = outcome.get("meta") or {}
-            if isinstance(meta, dict):
-                expert = meta.get("expert") or expert
-                regime = meta.get("regime") or regime
+    def normalize_mean(
+        self,
+        regime: Optional[str] = None,
+        target_mean: float = 1.0,
+    ) -> None:
+        """
+        Scale all weights so that mean becomes target_mean.
+        Useful to keep the bucket stable.
+        """
+        r = self.default_regime if regime is None else str(regime)
+        bucket = self._w.get(r)
+        if not bucket:
+            return
+        vals = list(bucket.values())
+        if not vals:
+            return
+        mean = sum(vals) / max(1, len(vals))
+        if mean <= 0:
+            return
+        scale = float(target_mean) / mean
+        for e, w in list(bucket.items()):
+            bucket[e] = _clamp(w * scale, self.min_w, self.max_w)
 
-        return str(expert or "UNKNOWN_EXPERT"), str(regime or "UNKNOWN")
+    def topk(self, k: int = 5, regime: Optional[str] = None) -> List[Tuple[str, float]]:
+        r = self.default_regime if regime is None else str(regime)
+        bucket = self._w.get(r, {})
+        return sorted(bucket.items(), key=lambda x: x[1], reverse=True)[: max(0, int(k))]
 
-    def _is_forced(self, outcome: Dict[str, Any]) -> bool:
-        if bool(outcome.get("forced", False)):
-            return True
-        meta = outcome.get("meta") or {}
-        if isinstance(meta, dict) and bool(meta.get("forced", False)):
-            return True
-        return False
+    def bottomk(self, k: int = 5, regime: Optional[str] = None) -> List[Tuple[str, float]]:
+        r = self.default_regime if regime is None else str(regime)
+        bucket = self._w.get(r, {})
+        return sorted(bucket.items(), key=lambda x: x[1])[: max(0, int(k))]
 
-    def _extract_atr(self, outcome: Dict[str, Any]) -> Optional[float]:
-        atr = None
-        risk = outcome.get("risk") or {}
-        meta = outcome.get("meta") or {}
+    # -----------------------------
+    # Persistence
+    # -----------------------------
+    def to_dict(self) -> Dict[str, Dict[str, float]]:
+        # deep copy-ish
+        return {r: dict(b) for r, b in self._w.items()}
 
-        if isinstance(risk, dict):
-            atr = risk.get("atr", atr)
-        if isinstance(meta, dict):
-            atr = meta.get("atr", atr)
+    def load_dict(self, data: Dict[str, Dict[str, float]]) -> None:
+        self._w = {}
+        for r, bucket in (data or {}).items():
+            rr = str(r)
+            self._w[rr] = {}
+            for e, w in (bucket or {}).items():
+                self._w[rr][str(e)] = _clamp(float(w), self.min_w, self.max_w)
 
-        if atr is None:
-            return None
-        try:
-            return float(atr)
-        except Exception:
-            return None
+    def load_json(self, path: str) -> None:
+        if not path:
+            return
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
 
-    def process_outcome(self, outcome: Dict[str, Any]) -> None:
-        # 1) keep old behavior (do not break)
-        try:
-            self.learner.learn_from_outcome(outcome)
-        except Exception:
-            pass
+        # allow both formats:
+        # (A) {"regime": {"expert": w}}
+        # (B) {"session": {...}, "pattern": {...}}  (your earlier structure)
+        if isinstance(obj, dict) and all(isinstance(v, dict) for v in obj.values()):
+            self.load_dict(obj)  # type: ignore[arg-type]
+            return
 
-        # 2) weight learning
-        if self.weight_store is not None:
-            try:
-                expert, regime = self._extract_expert_regime(outcome)
-                win = bool(outcome.get("win", False))
-                pnl = float(outcome.get("pnl", 0.0))
+        # fallback: try interpret as legacy structure
+        data: Dict[str, Dict[str, float]] = {}
+        if isinstance(obj, dict):
+            for r, bucket in obj.items():
+                if isinstance(bucket, dict):
+                    data[str(r)] = {str(e): float(w) for e, w in bucket.items()}
+        self.load_dict(data)
 
-                r = self.weight_store.outcome_reward(win=win, pnl=pnl)
-
-                # (B) forced trades have weaker learning signal
-                if self._is_forced(outcome):
-                    r *= float(self.forced_penalty)
-
-                # (B) scale down reward in high volatility if atr is present
-                atr = self._extract_atr(outcome)
-                if atr is not None and atr > 0:
-                    # atr bigger => reward smaller (avoid over-learning from spikes)
-                    r *= 1.0 / (1.0 + atr)
-
-                # main: expert
-                self.weight_store.update("expert", expert, r)
-                # lighter: regime
-                self.weight_store.update("regime", regime, float(self.regime_factor) * r)
-
-            except Exception:
-                pass
-
-        # 3) periodic stabilize actions
-        self._outcome_count += 1
-
-        if self.weight_store is not None:
-            # Decay
-            if self.decay_every > 0 and (self._outcome_count % self.decay_every == 0):
-                try:
-                    self.weight_store.decay_toward_one("expert", rate=self.decay_rate)
-                    self.weight_store.decay_toward_one("regime", rate=self.decay_rate)
-                except Exception:
-                    pass
-
-            # Normalize (B)
-            if self.normalize_every > 0 and (self._outcome_count % self.normalize_every == 0):
-                try:
-                    if hasattr(self.weight_store, "normalize_bucket"):
-                        self.weight_store.normalize_bucket("expert")
-                        self.weight_store.normalize_bucket("regime")
-                except Exception:
-                    pass
-
-            # Save (avoid IO each trade)
-            if self.autosave and self.save_every > 0 and (self._outcome_count % self.save_every == 0):
-                try:
-                    self.weight_store.save_json(self.weights_path or self.weight_store.path)  # type: ignore[arg-type]
-                except Exception:
-                    pass
-
-            # Summary log
-            if self.log_every > 0 and (self._outcome_count % self.log_every == 0):
-                try:
-                    top = self.weight_store.topk("expert", 5)
-                    bot = self.weight_store.bottomk("expert", 5)
-                    print(f"[weights] outcomes={self._outcome_count} top_expert={top} bottom_expert={bot}")
-                except Exception:
-                    pass
+    def save_json(self, path: str) -> None:
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
