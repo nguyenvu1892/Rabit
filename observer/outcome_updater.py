@@ -41,17 +41,42 @@ class OutcomeUpdater:
 
         # lazy init WeightStore to avoid circular import
         self.weight_store = weight_store
-        if self.weight_store is None:
-            try:
-                from brain.weight_store import WeightStore as _WS  # local import
-                self.weight_store = _WS(min_w=clamp_min, max_w=clamp_max)
-            except Exception:
-                self.weight_store = None
+        if self.weight_store and (self._outcome_count % self.stabilize_every == 0):
+            # stabilize EXPERT bucket
+            s1 = self.weight_store.stabilize_bucket(
+                "expert",
+                min_w=self.w_min,
+                max_w=self.w_max,
+                decay_rate=self.stabilize_decay,
+                target_mean=self.stabilize_target_mean,
+            )
+            # stabilize REGIME bucket
+            s2 = self.weight_store.stabilize_bucket(
+                "regime",
+                min_w=self.w_min,
+                max_w=self.w_max,
+                decay_rate=self.stabilize_decay,
+                target_mean=self.stabilize_target_mean,
+            )
+
+            # log top/bottom (nếu bro đã có log top/bottom ở đoạn summary thì giữ nguyên, còn chưa có thì add):
+            top_exp = self.weight_store.topk("expert", k=5)
+            bot_exp = self.weight_store.bottomk("expert", k=5)
+            top_reg = self.weight_store.topk("regime", k=5)
+            bot_reg = self.weight_store.bottomk("regime", k=5)
+
+            print(f"[WEIGHT][STABILIZE] expert {s1} | regime {s2}")
+            print(f"[WEIGHT][TOP] expert={top_exp} regime={top_reg}")
+            print(f"[WEIGHT][BOT] expert={bot_exp} regime={bot_reg}")
 
         self.weights_path = weights_path
         self.autosave = bool(autosave)
-        self.save_every = int(save_every)
-        self.decay_every = int(decay_every)
+        self.stabilize_every = 200          # hoặc 100/200 tuỳ bro, 200 khá ổn
+        self.stabilize_decay = 0.02         # decay nhẹ về 1.0 (anti-overfit)
+        self.stabilize_target_mean = 1.0
+        self.w_min = 0.2
+        self.w_max = 5.0
+
         self.decay_rate = float(decay_rate)
         self.forced_penalty = float(forced_penalty)
         self.lr = float(lr)

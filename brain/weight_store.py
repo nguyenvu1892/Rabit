@@ -153,6 +153,108 @@ class WeightStore:
         bucket = self._w.get(r, {})
         return sorted(bucket.items(), key=lambda x: x[1])[: max(0, int(k))]
 
+    def normalize_bucket(
+        self,
+        bucket: str,
+        target_mean: float = 1.0,
+        min_w: float | None = None,
+        max_w: float | None = None,
+        eps: float = 1e-12,
+    ) -> dict:
+        """
+        Normalize weights in a bucket so that mean ~= target_mean (default 1.0).
+        Returns stats: {bucket, n, mean_before, mean_after, scale}
+        """
+        b = self.weights.get(bucket, {})
+        if not isinstance(b, dict) or not b:
+            return {"bucket": bucket, "n": 0, "mean_before": 0.0, "mean_after": 0.0, "scale": 1.0}
+
+        vals = []
+        for _, v in b.items():
+            try:
+                vals.append(float(v))
+            except Exception:
+                pass
+
+        if not vals:
+            return {"bucket": bucket, "n": 0, "mean_before": 0.0, "mean_after": 0.0, "scale": 1.0}
+
+        mean_before = sum(vals) / max(1, len(vals))
+        if abs(mean_before) < eps:
+            return {"bucket": bucket, "n": len(vals), "mean_before": mean_before, "mean_after": mean_before, "scale": 1.0}
+
+        scale = float(target_mean) / float(mean_before)
+
+        # apply scaling
+        for k, v in list(b.items()):
+            try:
+                b[k] = float(v) * scale
+            except Exception:
+                # keep original if can't cast
+                pass
+
+        # optional clamp after normalize (safe)
+        if (min_w is not None) or (max_w is not None):
+            self.clamp_bucket(bucket, min_w=min_w, max_w=max_w)
+
+        # compute mean after
+        vals2 = []
+        for _, v in b.items():
+            try:
+                vals2.append(float(v))
+            except Exception:
+                pass
+        mean_after = (sum(vals2) / max(1, len(vals2))) if vals2 else 0.0
+
+        return {
+            "bucket": bucket,
+            "n": len(vals2),
+            "mean_before": mean_before,
+            "mean_after": mean_after,
+            "scale": scale,
+        }
+
+
+    def clamp_bucket(self, bucket: str, min_w: float | None = None, max_w: float | None = None) -> None:
+        b = self.weights.get(bucket, {})
+        if not isinstance(b, dict) or not b:
+            return
+        for k, v in list(b.items()):
+            try:
+                x = float(v)
+            except Exception:
+                continue
+            if min_w is not None and x < float(min_w):
+                x = float(min_w)
+            if max_w is not None and x > float(max_w):
+                x = float(max_w)
+            b[k] = x
+
+
+    def stabilize_bucket(
+        self,
+        bucket: str,
+        min_w: float | None = None,
+        max_w: float | None = None,
+        decay_rate: float = 0.0,
+        target_mean: float = 1.0,
+    ) -> dict:
+        """
+        5.0.8.7: clamp -> decay_toward_one -> normalize(mean->1.0) -> clamp again
+        """
+        # 1) clamp
+        if (min_w is not None) or (max_w is not None):
+            self.clamp_bucket(bucket, min_w=min_w, max_w=max_w)
+
+        # 2) decay
+        if decay_rate and decay_rate > 0:
+            self.decay_toward_one(bucket, rate=float(decay_rate))
+
+        # 3) normalize
+        stats = self.normalize_bucket(bucket, target_mean=float(target_mean), min_w=min_w, max_w=max_w)
+
+        return stats
+
     # -----------------------------
     # Persistence
     # -----------------------------
