@@ -1,144 +1,174 @@
 # brain/weight_store.py
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Tuple
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Dict, Optional
-
-
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
 
 
 @dataclass
+class WeightCfg:
+    lr: float = 0.05          # learning rate
+    decay: float = 0.0005     # per update decay toward 1.0
+    min_w: float = 0.2
+    max_w: float = 10.0
+    reward_clip: float = 1.0  # clip reward magnitude
+
+
 class WeightStore:
     """
-    Simple persistent weights store.
+    Stores weights by (bucket -> key -> weight)
 
-    Structure:
-    {
-      "expert":  {"MEAN_REVERT": 1.12, ...},
-      "regime":  {"trend_up": 1.05, ...},
-      "pattern": {...},
-      "session": {...},
-    }
+    Example:
+      bucket="expert", key="MEAN_REVERT"
+      bucket="regime", key="trend_up"
+      bucket="pattern", key="engulf"
 
-    Design goals:
-    - Backward compatible: allow get("KEY") defaulting to group="expert"
-    - Defensive: never crash core loop
+    Persistence format:
+      {"weights": {bucket: {key: weight}}}
+    but also accepts old plain dict {bucket: {key: weight}}
     """
 
-    path: Optional[str] = None
-    weights: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    def __init__(self, path: Optional[str] = None, cfg: Optional[WeightCfg] = None) -> None:
+        self.path = path
+        self.cfg = cfg or WeightCfg()
+        self._w: Dict[str, Dict[str, float]] = {}
 
-    # learning params (safe defaults)
-    lr: float = 0.05            # learning rate (small)
-    decay: float = 0.0005       # tiny decay to prevent explosion
-    w_min: float = 0.10
-    w_max: float = 5.00
-    default_weight: float = 1.0
+        if self.path:
+            self.load(self.path)
 
-    def ensure_group(self, group: str) -> None:
-        if group not in self.weights or not isinstance(self.weights[group], dict):
-            self.weights[group] = {}
-
-    # --- Persistence ---
-    def load_json(self, path: Optional[str] = None) -> None:
-        p = path or self.path
-        if not p:
+    # ------------------- IO -------------------
+    def load(self, path: str) -> None:
+        if not path or not os.path.exists(path):
+            self._w = {}
             return
-        if not os.path.exists(p):
-            return
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            # only accept dict[str, dict[str,float]]
-            cleaned: Dict[str, Dict[str, float]] = {}
-            for g, mp in data.items():
-                if not isinstance(mp, dict):
-                    continue
-                cleaned[g] = {}
-                for k, v in mp.items():
-                    try:
-                        cleaned[g][str(k)] = float(v)
-                    except Exception:
-                        pass
-            self.weights = cleaned
 
-    def save_json(self, path: Optional[str] = None) -> None:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            self._w = {}
+            return
+
+        if isinstance(data, dict) and "weights" in data and isinstance(data["weights"], dict):
+            self._w = data["weights"]
+        elif isinstance(data, dict):
+            self._w = data
+        else:
+            self._w = {}
+
+    def save(self, path: Optional[str] = None) -> None:
         p = path or self.path
         if not p:
             return
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        payload = {"weights": self._w}
         with open(p, "w", encoding="utf-8") as f:
-            json.dump(self.weights, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    # alias for convenience/back-compat
-    def save(self) -> None:
-        self.save_json(self.path)
+    # --- backward compatible aliases (older callers use load_json/save_json) ---
+    def load_json(self, path: str) -> None:
+        self.load(path)
 
-    # --- Read/Write API ---
-    def get(self, group_or_key: str, key: Optional[str] = None, default: Optional[float] = None) -> float:
-        """
-        Supports:
-        - get("expert","MEAN_REVERT")
-        - get("MEAN_REVERT") -> defaults group="expert"
-        """
-        if key is None:
-            group = "expert"
-            k = str(group_or_key)
-        else:
-            group = str(group_or_key)
-            k = str(key)
+    def save_json(self, path: str) -> None:
+        self.save(path)
 
-        self.ensure_group(group)
-        if default is None:
-            default = self.default_weight
-
+    # ------------------- core API -------------------
+    def get(self, bucket: str, key: str, default: float = 1.0) -> float:
         try:
-            return float(self.weights[group].get(k, float(default)))
+            return float(self._w.get(bucket, {}).get(key, default))
         except Exception:
             return float(default)
 
-    def set(self, group: str, key: str, value: float) -> None:
-        self.ensure_group(group)
-        self.weights[group][str(key)] = float(_clamp(float(value), self.w_min, self.w_max))
+    def set(self, bucket: str, key: str, value: float) -> None:
+        v = float(value)
+        v = max(self.cfg.min_w, min(self.cfg.max_w, v))
+        self._w.setdefault(bucket, {})[str(key)] = v
 
-    def update(self, group: str, key: str, reward: float) -> float:
+    def update(self, bucket: str, key: str, reward: float) -> float:
         """
-        Multiplicative update (safe & stable):
-        w <- clamp( w * (1 + lr*reward) - decay*w )
+        Stable additive update with clipping and light decay toward 1.0:
+          w <- decay_to_1(w) + lr * clip(reward)
         """
-        group = str(group)
-        key = str(key)
-        self.ensure_group(group)
-
-        w0 = self.get(group, key, default=self.default_weight)
         r = float(reward)
+        rc = float(self.cfg.reward_clip)
+        if rc > 0:
+            r = max(-rc, min(rc, r))
 
-        # multiplicative update + tiny decay
-        w1 = w0 * (1.0 + self.lr * r)
-        w1 = w1 - (self.decay * w1)
+        w = self.get(bucket, key, default=1.0)
 
-        w1 = _clamp(w1, self.w_min, self.w_max)
-        self.weights[group][key] = float(w1)
-        return float(w1)
+        # decay toward 1.0 first
+        d = float(self.cfg.decay)
+        if d > 0:
+            w = w + (1.0 - w) * d
 
-    # --- Reward shaping ---
-    def outcome_reward(self, win: bool, pnl: float = 0.0) -> float:
+        lr = float(self.cfg.lr)
+        w2 = w + lr * r
+        w2 = max(self.cfg.min_w, min(self.cfg.max_w, float(w2)))
+
+        self._w.setdefault(bucket, {})[str(key)] = float(w2)
+        return float(w2)
+
+    # ------------------- stabilize helpers (5.0.8.3) -------------------
+    def decay_toward_one(self, bucket: str, rate: float = 0.001) -> None:
         """
-        Map outcome -> reward in [-1, +1] (safe).
-        Prefer win/loss signal, pnl as bonus.
+        Extra decay pass toward 1.0 for a specific bucket (expert/regime).
+        Use small rate: 0.0005 ~ 0.005.
         """
-        base = 1.0 if bool(win) else -1.0
+        rate = float(rate)
+        if rate <= 0:
+            return
+        m = self._w.get(bucket, {})
+        if not isinstance(m, dict):
+            return
+        for k, v in list(m.items()):
+            try:
+                vv = float(v)
+                vv2 = vv + (1.0 - vv) * rate
+                m[k] = max(self.cfg.min_w, min(self.cfg.max_w, float(vv2)))
+            except Exception:
+                continue
 
-        # pnl bonus: compress strongly to avoid huge updates
-        try:
-            p = float(pnl)
-        except Exception:
-            p = 0.0
+    def topk(self, bucket: str, k: int = 5) -> List[Tuple[str, float]]:
+        m = self._w.get(bucket, {})
+        if not isinstance(m, dict):
+            return []
+        items: List[Tuple[str, float]] = []
+        for kk, vv in m.items():
+            try:
+                items.append((str(kk), float(vv)))
+            except Exception:
+                pass
+        items.sort(key=lambda x: x[1], reverse=True)
+        return items[: int(k)]
 
-        # scale pnl to small [-0.5, +0.5] band
-        bonus = _clamp(p / 100.0, -0.5, 0.5)
-        return float(_clamp(base + bonus, -1.0, 1.0))
+    def bottomk(self, bucket: str, k: int = 5) -> List[Tuple[str, float]]:
+        m = self._w.get(bucket, {})
+        if not isinstance(m, dict):
+            return []
+        items: List[Tuple[str, float]] = []
+        for kk, vv in m.items():
+            try:
+                items.append((str(kk), float(vv)))
+            except Exception:
+                pass
+        items.sort(key=lambda x: x[1])
+        return items[: int(k)]
+
+    # ------------------- reward shaping -------------------
+    @staticmethod
+    def outcome_reward(win: bool, pnl: float) -> float:
+        """
+        Reward shape: win gives +, loss gives -, pnl adds small magnitude.
+        Output roughly in [-1, +1].
+        """
+        base = 0.6 if bool(win) else -0.6
+        p = float(pnl)
+
+        if p > 0:
+            base += min(0.4, p / 10.0)
+        elif p < 0:
+            base -= min(0.4, abs(p) / 10.0)
+
+        return float(base)

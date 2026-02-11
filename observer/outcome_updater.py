@@ -15,9 +15,13 @@ except Exception:  # pragma: no cover
 class OutcomeUpdater:
     """
     Consumes trade outcomes and updates:
-    - ReinforcementLearner (existing behavior)
-    - WeightStore (new optional) [5.0.8.1]
-    Defensive: missing fields won't crash.
+      - ReinforcementLearner (existing behavior)
+      - WeightStore (optional) [5.0.8.1+]
+
+    5.0.8.3 additions:
+      - periodic save (avoid IO each trade)
+      - periodic decay toward 1.0 (anti-overfit)
+      - periodic summary log (top/bottom weights)
     """
 
     def __init__(
@@ -35,6 +39,13 @@ class OutcomeUpdater:
         self.weights_path = weights_path
         self.autosave = bool(autosave)
 
+        # ---- 5.0.8.3 stabilize knobs ----
+        self._outcome_count = 0
+        self.save_every = 200          # save weights every N outcomes
+        self.decay_every = 200         # decay every N outcomes
+        self.decay_rate = 0.001        # small decay
+        self.log_every = 200           # log every N outcomes (same cadence)
+
         # Load once if configured
         if self.weight_store is not None and self.weights_path:
             try:
@@ -44,11 +55,9 @@ class OutcomeUpdater:
                 pass
 
     def _extract_expert_regime(self, outcome: Dict[str, Any]) -> Tuple[str, str]:
-        # direct
         expert = outcome.get("expert")
         regime = outcome.get("regime")
 
-        # nested in risk/meta
         if not expert:
             risk = outcome.get("risk") or {}
             if isinstance(risk, dict):
@@ -64,29 +73,52 @@ class OutcomeUpdater:
         return str(expert or "UNKNOWN_EXPERT"), str(regime or "UNKNOWN")
 
     def process_outcome(self, outcome: Dict[str, Any]) -> None:
-        # 1) old behavior
+        # 1) keep old behavior (do not break)
         try:
             self.learner.learn_from_outcome(outcome)
         except Exception:
             pass
 
-        # 2) new weight learning
+        # 2) weight learning
         if self.weight_store is not None:
             try:
                 expert, regime = self._extract_expert_regime(outcome)
-
                 win = bool(outcome.get("win", False))
                 pnl = float(outcome.get("pnl", 0.0))
 
                 r = self.weight_store.outcome_reward(win=win, pnl=pnl)
 
-                # Update expert weight (main)
+                # main: expert
                 self.weight_store.update("expert", expert, r)
-
-                # Update regime weight (lighter)
+                # lighter: regime
                 self.weight_store.update("regime", regime, 0.3 * r)
-
-                if self.autosave:
-                    self.weight_store.save_json(self.weights_path or self.weight_store.path)
             except Exception:
                 pass
+
+        # 3) 5.0.8.3: periodic stabilize actions
+        self._outcome_count += 1
+
+        if self.weight_store is not None:
+            # Decay
+            if self.decay_every > 0 and (self._outcome_count % self.decay_every == 0):
+                try:
+                    self.weight_store.decay_toward_one("expert", rate=self.decay_rate)
+                    self.weight_store.decay_toward_one("regime", rate=self.decay_rate)
+                except Exception:
+                    pass
+
+            # Save (avoid IO each trade)
+            if self.autosave and self.save_every > 0 and (self._outcome_count % self.save_every == 0):
+                try:
+                    self.weight_store.save_json(self.weights_path or self.weight_store.path)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+
+            # Summary log
+            if self.log_every > 0 and (self._outcome_count % self.log_every == 0):
+                try:
+                    top = self.weight_store.topk("expert", 5)
+                    bot = self.weight_store.bottomk("expert", 5)
+                    print(f"[weights] outcomes={self._outcome_count} top_expert={top} bottom_expert={bot}")
+                except Exception:
+                    pass
