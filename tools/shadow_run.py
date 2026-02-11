@@ -11,6 +11,7 @@ from brain.journal import Journal
 from brain.reinforcement_learner import ReinforcementLearner
 from brain.weight_store import WeightStore
 from observer.outcome_updater import OutcomeUpdater
+from brain.trade_memory import TradeMemory
 
 
 def _import_risk_engine():
@@ -52,12 +53,22 @@ def main():
 
     # Learner + weight store only matter in train mode
     learner = ReinforcementLearner() if args.train else None
-    weight_store = WeightStore(args.weights)
-
-    outcome_updater = OutcomeUpdater(
-        learner=learner,
-        weight_store=weight_store,
-    ) if args.train else None
+    # tạo weight_store nếu có --weights
+    weight_store = WeightStore(path=args.weights) if args.weights else None
+    if weight_store:
+        weight_store.load_json(args.weights)
+    trade_memory = TradeMemory()
+    outcome_updater = (
+        OutcomeUpdater(
+            learner=learner,
+            trade_memory=trade_memory,
+            weight_store=weight_store,
+            weights_path=args.weights,
+            autosave=True,
+        )
+        if args.train
+        else None
+    )
 
     RiskEngineCls = _import_risk_engine()
     risk_engine = RiskEngineCls()
