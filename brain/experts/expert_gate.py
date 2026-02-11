@@ -62,6 +62,10 @@ class ExpertGate:
         best_decision.score is ORIGINAL score from expert.
         We add meta['score_adj'] and meta['weight'] for debugging/training.
         """
+        experts = self.registry.get_all()
+        if not experts:
+            return ExpertDecision(expert="NO_EXPERTS", score=0.0, allow=False, meta={"reason": "empty_registry"})
+
         decisions: List[ExpertDecision] = []
         for exp in self.registry.get_all():
             try:

@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from tkinter import S
 from typing import Any, Dict, List, Optional, Tuple
 
 from brain.regime_detector import detect_regime
 
+from brain.experts.expert_registry import ExpertRegistry, build_default_registry
+from brain.experts.expert_gate import ExpertGate
 # NOTE:
 # - Avoid circular imports: keep these imports local when needed.
 # - DecisionEngine must work even if meta layer is absent / optional.
@@ -29,30 +32,27 @@ class DecisionEngine:
 
     def __init__(
         self,
-        risk_engine: Any,
+        risk_engine: None,
         weight_store: Optional[Any] = None,
+        registry=None,
         meta_controller: Optional[Any] = None,
         enable_meta: bool = True,
         *,
         epsilon: float = 0.0,
         epsilon_cooldown: int = 0,
         seed: Optional[int] = None,
-    ) -> None:
+        **kwargs) -> None:
         self.risk_engine = risk_engine
         self.weight_store = weight_store
 
         # --- gate / registry ---
-        self.registry = self._build_registry()
-        self.gate = self._build_gate(
-            registry=self.registry,
-            weight_store=self.weight_store,
-            epsilon=epsilon,
-            epsilon_cooldown=epsilon_cooldown,
-            seed=seed,
-        )
+        if registry is None:
+            registry = build_default_registry()
+        self.registry: ExpertRegistry = registry
+        self.gate = ExpertGate(registry=self.registry, weight_store=self.weight_store)
 
         # --- meta (optional) ---
-        self.meta = None
+        self.meta = meta_controller
         if enable_meta:
             self.meta = self._build_meta(meta_controller)
 
