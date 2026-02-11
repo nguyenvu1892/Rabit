@@ -7,6 +7,13 @@ from typing import Any, Dict, List, Optional
 from brain.regime_detector import RegimeDetector, RegimeResult
 from brain.weight_store import WeightStore
 
+# ExpertSignal may or may not exist in your codebase at runtime.
+# Keep import safe to avoid breaking.
+try:
+    from brain.experts.expert_base import ExpertSignal  # type: ignore
+except Exception:  # pragma: no cover
+    ExpertSignal = Any  # type: ignore
+
 
 @dataclass
 class MetaDecision:
@@ -23,72 +30,78 @@ class MetaDecision:
 
 class MetaController:
     """
-    Meta-layer MoE gating:
+    Meta layer (MoE gating):
       - Detect regime
       - Pick primary expert
-      - Optional confirm experts adjust score
-      - Optional veto expert can block
+      - Optionally confirm with another expert
+      - Optionally veto if conflicts
+
+    Backward-compat:
+      - keeps evaluate(trade_features) -> MetaDecision
+      - adds enabled=True (so DecisionEngine can call MetaController(enabled=True) safely)
+      - adds _get_candles(...) to support multiple feature keys
     """
 
     def __init__(
         self,
-        enabled: bool = True,                      # ✅ ADD
         regime_detector: Optional[RegimeDetector] = None,
         experts: Optional[Dict[str, Any]] = None,
         store: Optional[WeightStore] = None,
         allow_threshold: float = 0.55,
+        enabled: bool = True,
     ) -> None:
-        self.enabled = bool(enabled)               # ✅ ADD
+        self.enabled = bool(enabled)
         self.detector = regime_detector or RegimeDetector()
-        self.experts: Dict[str, Any] = experts or {}
+        self.experts = experts or {}
         self.store = store or WeightStore()
         self.allow_threshold = float(allow_threshold)
 
+        # default mapping regime -> primary/confirm/veto
         self.policy = {
-            "TREND_STRONG": ("TREND_MA", ["SMC_PLACEHOLDER"], "RANGE_ZSCORE"),
-            "TREND_WEAK": ("TREND_MA", ["SMC_PLACEHOLDER"], "RANGE_ZSCORE"),
-            "RANGE": ("RANGE_ZSCORE", ["SMC_PLACEHOLDER"], "TREND_MA"),
-            "VOLATILITY_SPIKE": ("SMC_PLACEHOLDER", ["TREND_MA"], None),
-            "MIXED": ("TREND_MA", ["RANGE_ZSCORE"], "SMC_PLACEHOLDER"),
-            "UNKNOWN": ("TREND_MA", ["RANGE_ZSCORE"], None),
+            "breakout": ("TREND_MA", ["SMC_PLACEHOLDER"], "RANGE_ZSCORE"),
+            "trend": ("TREND_MA", ["SMC_PLACEHOLDER"], "RANGE_ZSCORE"),
+            "range": ("RANGE_ZSCORE", ["SMC_PLACEHOLDER"], "TREND_MA"),
+            "unknown": ("TREND_MA", ["RANGE_ZSCORE"], None),
         }
 
     def _get_expert(self, name: str):
         return self.experts.get(name)
 
     def _get_candles(self, trade_features: Dict[str, Any]) -> List[Dict[str, Any]]:
-        # support multiple legacy keys
+        # Support multiple keys across versions
         return (
-            trade_features.get("candles")
-            or trade_features.get("candles_window")
+            trade_features.get("candles_window")
+            or trade_features.get("candles")
             or trade_features.get("window")
             or []
         )
 
     def evaluate(self, trade_features: Dict[str, Any]) -> MetaDecision:
-        if not getattr(self, "enabled", True):
+        # Fail-safe: if disabled, never block old engine logic
+        if not self.enabled:
             return MetaDecision(
                 allow=True,
                 score=1.0,
                 reasons=["meta_disabled"],
-                regime="UNKNOWN",
+                regime="unknown",
                 primary_expert="",
                 confirm_experts=[],
                 veto_expert=None,
                 side="neutral",
                 risk_cfg={},
             )
-        candles = self._get_candles(trade_features)
-        reg: RegimeResult = self.detector.detect(candles)
 
-        primary_name, confirms, veto_name = self.policy.get(reg.regime, self.policy["MIXED"])
+        w = self._get_candles(trade_features)
+        reg: RegimeResult = self.detector.detect(w)
+
+        primary_name, confirms, veto_name = self.policy.get(reg.regime, self.policy["unknown"])
         primary = self._get_expert(primary_name)
 
         if primary is None:
             return MetaDecision(
                 allow=False,
                 score=0.0,
-                reasons=[f"missing_primary:{primary_name}"],
+                reasons=[f"missing_primary:{primary_name}", f"regime:{reg.regime}:{reg.confidence:.2f}"],
                 regime=reg.regime,
                 primary_expert=primary_name,
                 confirm_experts=[],
@@ -97,8 +110,9 @@ class MetaController:
                 risk_cfg={},
             )
 
-        # ExpertSignal-like object (we treat as duck-typed)
-        p_sig = primary.evaluate(trade_features)
+        # Duck-typed ExpertSignal
+        p_sig: ExpertSignal = primary.evaluate(trade_features)
+
         p_side = str(getattr(p_sig, "side", "neutral"))
         p_conf = float(getattr(p_sig, "confidence", getattr(p_sig, "score", 0.0)) or 0.0)
         p_reasons = list(getattr(p_sig, "reasons", []) or [])
@@ -113,7 +127,7 @@ class MetaController:
         if p_side == "neutral" or p_conf <= 0.01:
             return MetaDecision(
                 allow=False,
-                score=float(p_conf),
+                score=p_conf,
                 reasons=reasons + ["primary_neutral"],
                 regime=reg.regime,
                 primary_expert=primary_name,
@@ -123,7 +137,7 @@ class MetaController:
                 risk_cfg={},
             )
 
-        # Confirm stage
+        # confirm stage
         confirm_score = 0.0
         confirm_used: List[str] = []
 
@@ -131,6 +145,7 @@ class MetaController:
             ex = self._get_expert(cn)
             if ex is None:
                 continue
+
             s = ex.evaluate(trade_features)
             s_side = str(getattr(s, "side", "neutral"))
             s_conf = float(getattr(s, "confidence", getattr(s, "score", 0.0)) or 0.0)
@@ -148,7 +163,7 @@ class MetaController:
             else:
                 confirm_score -= 0.35 * s_conf
 
-        # Veto stage
+        # veto stage
         veto_hit = False
         if veto_name:
             vx = self._get_expert(veto_name)
@@ -165,7 +180,6 @@ class MetaController:
                     veto_hit = True
                     reasons.append("veto_hit")
 
-        # Score
         base = p_conf * (0.6 + 0.4 * float(reg.confidence))
         score = max(0.0, min(1.0, base + confirm_score))
         allow = (score >= self.allow_threshold) and (not veto_hit)
