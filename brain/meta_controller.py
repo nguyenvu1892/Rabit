@@ -30,7 +30,7 @@ class MetaController:
     """
     Meta layer (MoE gating).
 
-    IMPORTANT (per your requirement):
+    IMPORTANT:
     - meta must NOT be able to hard-block whole engine just because missing candles / missing expert
     - default mode is fail-open (allow=True) when inputs insufficient
     """
@@ -69,6 +69,7 @@ class MetaController:
             or trade_features.get("candles")
             or trade_features.get("window")
             or trade_features.get("bars")
+            or trade_features.get("rows")  # added compat
             or []
         )
 
@@ -151,7 +152,6 @@ class MetaController:
             p_reasons = list(getattr(sig, "reasons", []) or [])
             p_risk = dict(getattr(sig, "risk_hint", {}) or {})
         else:
-            # fallback to decide()
             raw = primary.decide(trade_features, {"regime": reg.regime})
             d = raw if isinstance(raw, dict) else getattr(raw, "__dict__", {})
             p_side = str(d.get("side", "neutral"))
@@ -163,7 +163,6 @@ class MetaController:
         reasons += [f"p:{r}" for r in p_reasons]
 
         if p_side == "neutral" or p_conf <= 0.01:
-            # FAIL-OPEN: do not kill engine, just say meta is neutral
             return MetaDecision(
                 allow=True if self.fail_open else False,
                 score=float(p_conf),
@@ -176,7 +175,6 @@ class MetaController:
                 risk_cfg={},
             )
 
-        # confirm stage (optional)
         confirm_score = 0.0
         confirm_used: List[str] = []
         for cn in confirms:
@@ -211,7 +209,6 @@ class MetaController:
 
         allow = (score >= self.allow_threshold) and (not veto_hit)
         if self.fail_open and (not allow):
-            # fail-open: meta can *recommend deny*, but does not hard block engine.
             reasons.append("meta_recommend_deny_but_fail_open")
             allow = True
 
