@@ -15,7 +15,7 @@ from brain.reinforcement_learner import ReinforcementLearner
 from brain.weight_store import WeightStore
 
 from observer.outcome_updater import OutcomeUpdater
-
+import inspect
 # Optional: evaluation reporter (5.1.1)
 try:
     from observer.eval_reporter import EvalReporter
@@ -174,18 +174,60 @@ def main():
     )
 
     # Some ShadowRunner.run versions don't accept `candles=` kw; use compat fallbacks
-    try:
-        stats = runner.run(candles=candles, **run_kwargs)
-    except TypeError:
+    def _call_shadowrunner_run_compat(runner, candles, run_kwargs: dict):
+        """
+        Compat layer for ShadowRunner.run across versions:
+        - Some versions accept kwargs: candles=..., journal=..., horizon=...
+        - Some versions accept only positional args and reject ALL kwargs.
+        - Some versions use different input param name (candles/data/rows).
+        """
         try:
-            # most common: first positional arg is candles/data
-            stats = runner.run(candles, **run_kwargs)
-        except TypeError:
-            try:
-                # alternative kw names
-                stats = runner.run(data=candles, **run_kwargs)
-            except TypeError:
-                stats = runner.run(rows=candles, **run_kwargs)
+            sig = inspect.signature(runner.run)
+            params = list(sig.parameters.values())
+            param_names = [p.name for p in params]
+
+            # remove 'self' if present
+            if param_names and param_names[0] == "self":
+                param_names = param_names[1:]
+
+            # Build filtered kwargs that run() actually accepts
+            filtered = {}
+            for k, v in (run_kwargs or {}).items():
+                if k in param_names:
+                    filtered[k] = v
+
+            # Decide how to pass candles
+            # If run() has a named input param, pass by that name; otherwise pass as 1st positional
+            input_name = None
+            for cand_name in ("candles", "data", "rows", "series", "df", "bars", "prices"):
+                if cand_name in param_names:
+                    input_name = cand_name
+                    break
+
+            if input_name is not None:
+                # pass candles as kw + filtered other kwargs
+                return runner.run(**{input_name: candles, **filtered})
+
+            # else: positional candles first, plus ONLY kwargs supported
+            # if run() supports no kwargs => filtered will be empty
+            return runner.run(candles, **filtered)
+
+        except Exception:
+            # absolute fallback: positional only, no kwargs
+            return runner.run(candles)
+
+
+    # ---- later in main() where you run ----
+    run_kwargs = dict(
+        journal=journal,
+        horizon=args.horizon,
+        train=args.train,
+        max_steps=args.max_steps,
+        lookback=args.lookback,
+    )
+
+    stats = _call_shadowrunner_run_compat(runner, candles, run_kwargs)
+
 
 
     stats_dict = _stats_to_dict(stats)
