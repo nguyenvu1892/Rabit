@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from brain.experts.expert_gate import ExpertGate
+
 
 @dataclass
 class EngineDecision:
@@ -16,9 +16,9 @@ class EngineDecision:
 class DecisionEngine:
     """
     Coordinates:
-    - Regime detection
-    - ExpertGate picking (uses WeightStore if provided)
-    - (Optional) MetaController hooks
+      - Regime detection
+      - ExpertGate picking (uses WeightStore if provided)
+      - (Optional) MetaController hooks
     """
 
     def __init__(
@@ -62,15 +62,17 @@ class DecisionEngine:
         Create ExpertRegistry and register experts.
 
         Robust strategy:
-        - import experts modules
-        - auto-discover register_* functions
-        - accept common API patterns
-        - fallback baseline expert if registry stays empty
+          - import experts modules
+          - auto-discover register_* functions
+          - accept common API patterns
+          - fallback baseline expert if registry stays empty
         """
         from brain.experts.expert_registry import ExpertRegistry
-        from brain.experts.experts_basic import DEFAULT_EXPERTS
+
         reg = ExpertRegistry()
+
         def _reg_add(expert_obj: Any) -> bool:
+            """Try multiple registry APIs to add/register an expert instance."""
             for meth in ("register", "add", "add_expert", "register_expert"):
                 if hasattr(reg, meth):
                     try:
@@ -91,7 +93,17 @@ class DecisionEngine:
             return []
 
         def _maybe_register_module(mod: Any) -> None:
-            # known names
+            """
+            Accept patterns:
+              - register(reg)
+              - register_experts(reg)
+              - register_basic_experts(reg)
+              - register_simple_experts(reg)
+              - any function starting with 'register_' that accepts 1 arg
+              - EXPERTS list/tuple of expert instances
+              - build_experts()/make_experts() returning list
+            """
+            # explicit known names
             for fn_name in (
                 "register",
                 "register_experts",
@@ -105,7 +117,7 @@ class DecisionEngine:
                     except Exception:
                         pass
 
-            # any register_* (1 arg)
+            # auto any register_* (1 arg)
             for name in dir(mod):
                 if not name.startswith("register_"):
                     continue
@@ -115,6 +127,7 @@ class DecisionEngine:
                 try:
                     fn(reg)
                 except TypeError:
+                    # wrong signature
                     continue
                 except Exception:
                     continue
@@ -137,7 +150,7 @@ class DecisionEngine:
                     except Exception:
                         pass
 
-        # Try import modules
+        # Try import modules (no hard dependency on exact function names)
         for mod_path in (
             "brain.experts.experts_basic",
             "brain.experts.simple_experts",
@@ -149,7 +162,7 @@ class DecisionEngine:
             except Exception:
                 continue
 
-        # Fallback baseline expert
+        # Fallback: if still empty, add a baseline expert so system doesn't hard-deny everything
         if len(_get_all()) == 0:
             from brain.experts.expert_base import ExpertDecision
 
@@ -157,6 +170,7 @@ class DecisionEngine:
                 name = "BASELINE"
 
                 def decide(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
+                    # minimal allow to keep pipeline alive; score small so real experts override when available
                     return ExpertDecision(
                         expert=self.name,
                         allow=True,
@@ -190,6 +204,7 @@ class DecisionEngine:
         if seed is not None:
             try:
                 import random
+
                 kwargs["rng"] = random.Random(int(seed))
             except Exception:
                 pass
@@ -198,6 +213,7 @@ class DecisionEngine:
         try:
             return ExpertGate(**kwargs)
         except TypeError:
+            # fallback: remove unknown keys
             for k in ("weight_store", "rng", "epsilon_cooldown"):
                 if k in kwargs:
                     tmp = dict(kwargs)
@@ -213,6 +229,7 @@ class DecisionEngine:
             return meta_controller
         try:
             from brain.meta_controller import MetaController  # type: ignore
+
             try:
                 return MetaController()
             except TypeError:
@@ -232,6 +249,7 @@ class DecisionEngine:
                 self.gate.set_epsilon(float(epsilon))
             except Exception:
                 pass
+
         try:
             if hasattr(self.gate, "epsilon_cooldown"):
                 setattr(self.gate, "epsilon_cooldown", int(cooldown))
@@ -244,20 +262,11 @@ class DecisionEngine:
     def evaluate_trade(self, trade_features: Dict[str, Any]) -> Tuple[bool, float, Dict[str, Any]]:
         """
         Return: (allow, score, risk_cfg)
-        risk_cfg must include regime + expert so OutcomeUpdater can credit-assign.
         """
         from brain.regime_detector import detect_regime
 
         candles: List[Any] = trade_features.get("candles") or trade_features.get("window") or []
-        context: Dict[str, Any] = detect_regime(candles) if candles is not None else {"regime": "UNKNOWN", "confidence": 0.0}
-
-        # normalize keys (regime-first 5.1.3)
-        regime = str(context.get("regime", "UNKNOWN"))
-        regime_conf = float(context.get("confidence", 0.0))
-        context["regime"] = regime
-        context["regime_conf"] = regime_conf  # canonical key for downstream
-        context.setdefault("vol", 0.0)
-        context.setdefault("slope", 0.0)
+        context: Dict[str, Any] = detect_regime(candles) if candles is not None else {"regime": "UNKNOWN"}
 
         # Meta pre-hook
         if self.meta is not None and hasattr(self.meta, "pre_decision"):
@@ -267,10 +276,8 @@ class DecisionEngine:
                 pass
 
         best, _all_decisions = self.gate.pick(trade_features, context)
-        print("DEBUG BEST:", best)
-        print("DEBUG BEST_SCORE:", getattr(best, "score", None))
-        print("DEBUG BEST_EXPERT:", getattr(best, "expert", None))
-        print("DEBUG BEST_META:", getattr(best, "meta", None))
+
+        # Normalize best decision shape
         if isinstance(best, dict):
             allow = bool(best.get("allow", False))
             score = float(best.get("score", 0.0))
@@ -284,20 +291,14 @@ class DecisionEngine:
             if meta is not None and not isinstance(meta, dict):
                 meta = None
 
-        # risk_cfg is what OutcomeUpdater uses later
-        regime = str(context.get("regime", "UNKNOWN"))
         risk_cfg: Dict[str, Any] = {
             "expert": expert_name,
-            "regime": regime,
-            "regime_conf": regime_conf,
+            "regime": context.get("regime", "UNKNOWN"),
         }
         if meta:
             risk_cfg["meta"] = meta
 
-        meta = meta or {}
-        meta["regime"] = regime
-        meta["expert"] = expert_name
-                # Meta post-hook
+        # Meta post-hook
         if self.meta is not None and hasattr(self.meta, "post_decision"):
             try:
                 self.meta.post_decision(
@@ -309,4 +310,3 @@ class DecisionEngine:
                 pass
 
         return allow, score, risk_cfg
-    

@@ -5,6 +5,32 @@ from typing import Any, Dict, Optional
 
 from brain.trade_memory import TradeMemory
 
+def _clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _get_meta(decision: Any) -> Dict[str, Any]:
+    if decision is None:
+        return {}
+    if isinstance(decision, dict):
+        return decision.get("meta") or {}
+    return getattr(decision, "meta", None) or {}
+
+
+def _get_expert(decision: Any) -> str:
+    if decision is None:
+        return "UNKNOWN"
+    if isinstance(decision, dict):
+        return str(decision.get("expert") or "UNKNOWN")
+    return str(getattr(decision, "expert", "UNKNOWN"))
+
 
 class OutcomeUpdater:
     """
@@ -48,7 +74,46 @@ class OutcomeUpdater:
                 self.weight_store.path = self.weights_path
         except Exception:
             pass
+    def update(self, decision: Any, pnl: float, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        context = context or {}
+        meta = _get_meta(decision)
+        expert = _get_expert(decision)
 
+        regime = str(context.get("regime", meta.get("regime", "unknown")))
+        bucket = context.get("bucket", meta.get("bucket"))
+
+        raw_score = _safe_float(meta.get("raw_score", meta.get("raw", 0.0)), 0.0)
+        w = _safe_float(meta.get("w", 1.0), 1.0)
+        adj_score = _safe_float(meta.get("adj_score", 0.0), 0.0)
+        if adj_score == 0.0 and raw_score != 0.0:
+            adj_score = raw_score * w
+
+        # confidence in [0.1..1.0] so learning never fully stops
+        confidence = _clip(abs(adj_score), 0.1, 1.0)
+        scaled_reward = _safe_float(pnl, 0.0) * confidence
+
+        # store for reporter/debug
+        meta["confidence"] = confidence
+        meta["scaled_reward"] = scaled_reward
+        meta["regime"] = regime
+        meta["bucket"] = bucket
+
+        # update weight_store with best-effort signature matching
+        if hasattr(self.weight_store, "update") and callable(getattr(self.weight_store, "update")):
+            try:
+                # update(expert, regime, reward, bucket)
+                self.weight_store.update(expert, regime, scaled_reward, bucket)
+            except TypeError:
+                try:
+                    # update(expert, regime, reward)
+                    self.weight_store.update(expert, regime, scaled_reward)
+                except TypeError:
+                    # update(key, reward)
+                    key = f"{regime}|{bucket}|{expert}" if bucket else f"{regime}|{expert}"
+                    self.weight_store.update(key, scaled_reward)
+
+        return meta
+        
     def on_outcome(self, snapshot: Dict[str, Any]) -> None:
         self._updates += 1
 
