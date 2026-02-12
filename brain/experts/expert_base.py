@@ -16,10 +16,19 @@ class ExpertDecision:
     """
 
     expert: str
-    score: float
-    allow: bool
-    action: str
-    meta: Dict[str, Any]
+    score: float = 0.0
+    allow: bool = True
+    action: str = "hold"
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "expert": str(self.expert),
+            "score": float(self.score) if self.score is not None else 0.0,
+            "allow": bool(self.allow),
+            "action": str(self.action) if self.action else "hold",
+            "meta": dict(self.meta) if isinstance(self.meta, dict) else {"meta": self.meta},
+        }
 
     def __init__(
         self,
@@ -71,63 +80,56 @@ class ExpertDecision:
         self.meta = dict(meta)
 
 
-class BaseExpert(Protocol):
+class ExpertBase(Protocol):
     """Minimal interface for an Expert."""
 
     name: str
 
-    def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Any: ...
-
-
-# Backward-compatible alias (some modules import ExpertBase)
-ExpertBase = BaseExpert
+    def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Optional[ExpertDecision]:
+        ...
 
 
 def coerce_decision(raw: Any, fallback_expert: str = "UNKNOWN") -> Optional[ExpertDecision]:
-    """Convert arbitrary expert output -> ExpertDecision."""
+    """
+    Normalize anything into ExpertDecision.
+    Accepts:
+      - ExpertDecision
+      - dict-like {expert, score, allow, action, meta}
+      - tuple/list ("buy"/"sell"/"hold", score)
+    """
     if raw is None:
         return None
 
     if isinstance(raw, ExpertDecision):
+        # normalize missing action in legacy objects (just in case)
+        if not getattr(raw, "action", None):
+            raw.action = "hold"
         return raw
 
-    # dict payload
+    # dict-like
     if isinstance(raw, dict):
         expert = str(raw.get("expert", fallback_expert))
-        score = float(raw.get("score", 0.0) or 0.0)
-        allow = bool(raw.get("allow", score > 0))
-        action = str(raw.get("action", "hold") or "hold")
-        meta = raw.get("meta") or {}
-        extra = {k: v for k, v in raw.items() if k not in {"expert", "score", "allow", "action", "meta"}}
-        if extra:
-            meta = {**meta, **extra}
-        return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=meta)
+        score = raw.get("score", 0.0)
+        allow = raw.get("allow", True)
+        action = raw.get("action", "hold") or "hold"
+        meta = raw.get("meta", {})
+        if not isinstance(meta, dict):
+            meta = {"meta": meta}
+        try:
+            score_f = float(score) if score is not None else 0.0
+        except Exception:
+            score_f = 0.0
+        return ExpertDecision(expert=expert, score=score_f, allow=bool(allow), action=str(action), meta=meta)
 
-    # tuple/list: (score, allow) or (score, allow, action)
-    if isinstance(raw, (tuple, list)) and len(raw) >= 2:
-        score = float(raw[0] or 0.0)
-        allow = bool(raw[1])
-        action = str(raw[2]) if len(raw) >= 3 and raw[2] is not None else "hold"
-        return ExpertDecision(expert=str(fallback_expert), score=score, allow=allow, action=action, meta={})
+    # tuple/list shorthand: (action, score)
+    if isinstance(raw, (tuple, list)) and len(raw) >= 1:
+        action = raw[0] if len(raw) >= 1 else "hold"
+        score = raw[1] if len(raw) >= 2 else 0.0
+        try:
+            score_f = float(score) if score is not None else 0.0
+        except Exception:
+            score_f = 0.0
+        return ExpertDecision(expert=str(fallback_expert), score=score_f, allow=True, action=str(action), meta={})
 
-    # numeric score
-    if isinstance(raw, (int, float)):
-        score = float(raw)
-        return ExpertDecision(expert=str(fallback_expert), score=score, allow=(score > 0), action="hold", meta={})
-
-    # unknown object -> attribute access
-    try:
-        score = float(getattr(raw, "score"))
-        allow = bool(getattr(raw, "allow", score > 0))
-        action = str(getattr(raw, "action", "hold"))
-        expert = str(getattr(raw, "expert", fallback_expert))
-        meta = getattr(raw, "meta", {}) or {}
-        return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=dict(meta))
-    except Exception:
-        return ExpertDecision(
-            expert=str(fallback_expert),
-            score=0.0,
-            allow=False,
-            action="hold",
-            meta={"coerce_error": repr(raw)},
-        )
+    # fallback: not supported
+    return None

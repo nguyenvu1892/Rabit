@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from brain.weight_store import WeightStore
-
+from brain.regime_detector import RegimeDetector
+from brain.meta_controller import MetaController
+from brain.experts.expert_registry import ExpertRegistry
+from brain.experts.expert_gate import ExpertGate, ExpertDecision
 
 @dataclass
 class DecisionContext:
@@ -13,6 +15,13 @@ class DecisionContext:
     session: Optional[str] = None
     # you can add more tags later: volatility_bucket, news_flag...
 
+@dataclass
+class DecisionResult:
+    allow: bool
+    score: float
+    risk_cfg: Dict[str, Any]
+    best: Optional[ExpertDecision]
+    all_decisions: list
 
 @dataclass
 class EngineDecision:
@@ -36,60 +45,27 @@ class DecisionEngine:
 
     def __init__(
         self,
-        risk_engine: Any,
-        weight_store: Optional[WeightStore] = None,
-        regime_detector: Optional[Any] = None,
-        expert_gate: Optional[Any] = None,
-        expert_registry: Optional[Any] = None,
+        risk_engine: Any = None,
+        weight_store: Any = None,
+        regime_detector: Optional[RegimeDetector] = None,
+        meta_controller: Optional[MetaController] = None,
+        **kwargs,
     ) -> None:
         self.risk_engine = risk_engine
         self.weight_store = weight_store
-        self.regime_detector = regime_detector
+        self.regime_detector = regime_detector or RegimeDetector()
+        self.meta_controller = meta_controller or MetaController()
+        self.registry = self._build_registry()
+        self.gate = ExpertGate(self.registry, weight_store=self.weight_store)
 
-        # lazy import to avoid circulars
-        self.registry = expert_registry or self._build_registry()
-        self.gate = expert_gate or self._build_gate()
-
-    def _build_registry(self) -> Any:
-        """
-        Default registry builder.
-        Works with your current structure:
-          - brain/experts/experts_basic.py provides DEFAULT_EXPERTS
-          - brain/experts/expert_registry.py provides ExpertRegistry
-        """
-        try:
-            from brain.experts.expert_registry import ExpertRegistry
-        except Exception:
-            ExpertRegistry = None  # type: ignore
-
-        try:
-            from brain.experts.experts_basic import DEFAULT_EXPERTS
-        except Exception:
-            DEFAULT_EXPERTS = []  # type: ignore
-
-        if ExpertRegistry is None:
-            # fallback: registry as a simple list container
-            class _SimpleRegistry:
-                def __init__(self, experts):
-                    self._experts = experts
-
-                def get_all(self):
-                    return list(self._experts)
-
-            return _SimpleRegistry(DEFAULT_EXPERTS)
-
+    def _build_registry(self) -> ExpertRegistry:
+            # keep your existing ExpertRegistry behavior
         reg = ExpertRegistry()
-        # Support both:
-        #   - reg.register(expert)
-        #   - reg.add(expert)
-        for exp in DEFAULT_EXPERTS:
-            try:
-                if hasattr(reg, "register"):
-                    reg.register(exp)
-                elif hasattr(reg, "add"):
-                    reg.add(exp)
-            except Exception:
-                continue
+        try:
+            reg.register_defaults()
+        except Exception:
+            # fallback: ExpertRegistry might auto-register elsewhere
+            pass
         return reg
 
     def _build_gate(self) -> Any:
@@ -123,59 +99,55 @@ class DecisionEngine:
             return "unknown"
 
     def evaluate_trade(self, trade_features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Tuple[bool, float, Dict[str, Any]]:
-        """
-        Returns (allow, score, risk_cfg)
-        """
-        ctx = context or {}
-        regime = self._detect_regime(trade_features)
-        dctx = DecisionContext(regime=regime, session=ctx.get("session"))
+        ctx: Dict[str, Any] = dict(context or {})
 
-        # ExpertGate returns (best_decision, all_decisions)
-        best, all_decisions = None, []
+        # 1) detect regime
+        regime = "unknown"
         try:
-            best, all_decisions = self.gate.pick(trade_features, {"regime": dctx.regime, "session": dctx.session})
-        except Exception as e:
-            best = None
-            all_decisions = []
-            ctx["gate_error"] = repr(e)
+            if hasattr(self.regime_detector, "detect"):
+                regime = self.regime_detector.detect(trade_features)
+            elif hasattr(self.regime_detector, "classify"):
+                regime = self.regime_detector.classify(trade_features)
+        except Exception:
+            regime = "unknown"
 
-        # If gate returned None (or empty), create a safe fallback
-        if best is None:
-            best = EngineDecision(
-                allow=True,                 # IMPORTANT: do not deadlock the sim
-                score=0.0001,
-                action="hold",
-                expert="FALLBACK",
-                meta={"reason": "no_best_from_gate", "regime": dctx.regime},
-            )
-        else:
-            # normalize best to EngineDecision shape if your ExpertDecision differs
-            if not isinstance(best, EngineDecision):
-                # Many versions use ExpertDecision dataclass with fields:
-                # (expert, score, allow, action, meta)
-                allow = bool(getattr(best, "allow", False))
-                score = float(getattr(best, "score", 0.0) or 0.0)
-                action = str(getattr(best, "action", "hold") or "hold")
-                expert = str(getattr(best, "expert", "UNKNOWN") or "UNKNOWN")
-                meta = dict(getattr(best, "meta", {}) or {})
-                meta.setdefault("regime", dctx.regime)
-                best = EngineDecision(allow=allow, score=score, action=action, expert=expert, meta=meta)
+        ctx["regime"] = str(regime or "unknown")
 
-        # Risk engine gate
-        risk_cfg: Dict[str, Any] = {}
-        allow = bool(best.allow)
-        score = float(best.score)
-
+        # 2) meta policy (threshold, epsilon)
+        meta_policy = {}
         try:
-            if self.risk_engine is not None and hasattr(self.risk_engine, "evaluate"):
-                allow, score, risk_cfg = self.risk_engine.evaluate(trade_features, best_action=best.action, score=score)
-        except Exception as e:
-            risk_cfg = {"error": repr(e)}
+            meta_policy = self.meta_controller.get_policy(ctx["regime"])
+        except Exception:
+            meta_policy = {"score_threshold": 0.0, "epsilon": 0.05}
 
-        # attach debug for eval_reporter / shadow_run
-        risk_cfg["best_expert"] = best.expert
-        risk_cfg["best_action"] = best.action
-        risk_cfg["best_score"] = score
-        risk_cfg["regime"] = dctx.regime
+        ctx["meta_policy"] = meta_policy
 
-        return bool(allow), float(score), risk_cfg
+        # 3) pick via gate
+        best, all_decisions = self.gate.pick(trade_features, ctx)
+
+        # normalize
+        best_score = 0.0
+        best_expert = None
+        best_allow = False
+        if best is not None:
+            best_score = float(getattr(best, "score", 0.0) or 0.0)
+            best_expert = str(getattr(best, "expert", "unknown") or "unknown")
+            best_allow = bool(getattr(best, "allow", False))
+
+        # 4) call meta_controller with decision (confidence = best_score clipped)
+        try:
+            conf = max(0.0, min(1.0, float(best_score)))
+            self.meta_controller.on_decision(ctx["regime"], best_allow, conf)
+        except Exception:
+            pass
+
+        # 5) risk cfg (used by outcome_updater + weight_store updates)
+        risk_cfg = {
+            "expert": best_expert,
+            "regime": ctx["regime"],
+            "score": best_score,
+            "score_threshold": float(meta_policy.get("score_threshold", 0.0)),
+            "epsilon": float(meta_policy.get("epsilon", 0.0)),
+        }
+
+        return best_allow, best_score, risk_cfg
