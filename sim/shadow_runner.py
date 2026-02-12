@@ -1,10 +1,27 @@
 # sim/shadow_runner.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 import random
 import traceback
+
+
+def _regime_key(risk_cfg: Dict[str, Any]) -> str:
+    if not isinstance(risk_cfg, dict):
+        return "unknown"
+    r = risk_cfg.get("regime") or risk_cfg.get("market_regime") or risk_cfg.get("state")
+    return str(r) if r is not None else "unknown"
+
+
+def _regime_conf(risk_cfg: Dict[str, Any]) -> float:
+    if not isinstance(risk_cfg, dict):
+        return 0.0
+    c = risk_cfg.get("regime_conf") or risk_cfg.get("confidence") or 0.0
+    try:
+        return float(c)
+    except Exception:
+        return 0.0
 
 
 @dataclass
@@ -14,11 +31,39 @@ class ShadowStats:
     allow: int = 0
     deny: int = 0
     errors: int = 0
+
     outcomes: int = 0
     wins: int = 0
     losses: int = 0
     total_pnl: float = 0.0
+
     forced_entries: int = 0
+
+    # ✅ NEW: regime-first breakdown
+    # structure:
+    # {
+    #   "trend": {"decisions":..,"allow":..,"deny":..,"outcomes":..,"wins":..,"losses":..,"pnl":..,"forced":..,"conf_sum":..,"conf_n":..}
+    # }
+    regime_breakdown: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    def _rb_row(self, regime: str) -> Dict[str, Any]:
+        row = self.regime_breakdown.get(regime)
+        if row is None:
+            row = {
+                "decisions": 0,
+                "allow": 0,
+                "deny": 0,
+                "errors": 0,
+                "outcomes": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl": 0.0,
+                "forced": 0,
+                "conf_sum": 0.0,
+                "conf_n": 0,
+            }
+            self.regime_breakdown[regime] = row
+        return row
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -32,6 +77,8 @@ class ShadowStats:
             "losses": self.losses,
             "total_pnl": self.total_pnl,
             "forced_entries": self.forced_entries,
+            # ✅ NEW
+            "regime_breakdown": self.regime_breakdown,
         }
 
 
@@ -90,14 +137,12 @@ class ShadowRunner:
 
         start = max(int(lookback), 0)
         end = min(n - int(horizon), start + int(max_steps))
-
         if end <= start:
             return stats
 
         for i in range(start, end):
             stats.steps += 1
             window = candles[i - lookback : i]
-
             trade_features = {
                 "candles": window,
                 "step": i,
@@ -110,12 +155,24 @@ class ShadowRunner:
                 risk_cfg = risk_cfg or {}
                 forced = bool(risk_cfg.get("forced", False))
 
+                # ✅ regime-first tagging
+                regime = _regime_key(risk_cfg)
+                conf = _regime_conf(risk_cfg)
+                row = stats._rb_row(regime)
+                row["decisions"] += 1
+                if conf > 0:
+                    row["conf_sum"] += float(conf)
+                    row["conf_n"] += 1
+
                 if bool(allow):
                     stats.allow += 1
+                    row["allow"] += 1
                     if forced:
                         stats.forced_entries += 1
+                        row["forced"] += 1
                 else:
                     stats.deny += 1
+                    row["deny"] += 1
 
                 # journal decision
                 if journal is not None:
@@ -134,13 +191,19 @@ class ShadowRunner:
                 # training outcome
                 if train_mode and bool(allow):
                     outcome = self.simulate_outcome(float(score))
-
                     stats.outcomes += 1
+                    row["outcomes"] += 1
+
                     if outcome.get("win"):
                         stats.wins += 1
+                        row["wins"] += 1
                     else:
                         stats.losses += 1
-                    stats.total_pnl += float(outcome.get("pnl", 0.0))
+                        row["losses"] += 1
+
+                    pnl = float(outcome.get("pnl", 0.0))
+                    stats.total_pnl += pnl
+                    row["pnl"] += pnl
 
                     # snapshot đầy đủ cho OutcomeUpdater học expert/regime/forced
                     snapshot = {
@@ -165,6 +228,16 @@ class ShadowRunner:
             except Exception as e:
                 stats.errors += 1
 
+                # try attribute-safe regime logging on error path
+                try:
+                    # if risk_cfg exists in locals
+                    risk_cfg_local = locals().get("risk_cfg") or {}
+                    regime = _regime_key(risk_cfg_local)
+                    row = stats._rb_row(regime)
+                    row["errors"] += 1
+                except Exception:
+                    pass
+
                 # debug: in 3 lỗi đầu tiên ra terminal cho dễ bắt gốc
                 if stats.errors <= 3:
                     print("[ShadowRunner] FIRST ERROR:", repr(e))
@@ -175,7 +248,6 @@ class ShadowRunner:
                         journal.log_error(step=i, error=traceback.format_exc())
                     except Exception:
                         pass
-
                 continue
 
         return stats

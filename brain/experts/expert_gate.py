@@ -1,153 +1,162 @@
-# brain/experts/expert_gate.py
 from __future__ import annotations
 
-import random
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 from .expert_base import ExpertDecision, coerce_decision
 
-if TYPE_CHECKING:
-    from .expert_registry import ExpertRegistry
-
+def _decision_to_trace(d):
+    # d có thể là ExpertDecision hoặc dict-like
+    meta = getattr(d, "meta", None) or {}
+    return {
+        "expert": getattr(d, "expert", None),
+        "allow": bool(getattr(d, "allow", False)),
+        "action": getattr(d, "action", "hold"),
+        "score": float(getattr(d, "score", 0.0) or 0.0),           # adjusted score (sau weight)
+        "raw_score": float(meta.get("raw_score", meta.get("raw", 0.0)) or 0.0),
+        "w": float(meta.get("w", 1.0) or 1.0),
+        "regime": meta.get("regime"),
+        "bucket": meta.get("bucket"),
+    }
 
 class ExpertGate:
     """
-    Chooses an expert decision from ExpertRegistry.
-    Supports exploration (epsilon) and weight adjustment via WeightStore.
-
-    WeightStore compatibility:
-      - get(expert_name) -> float
-      - OR get(expert_name, regime) -> float
+    Picks the best expert decision, optionally adjusted by weights (expert, regime).
     """
-
-    def __init__(
-        self,
-        registry: "ExpertRegistry",
-        weight_store: Any = None,
-        epsilon: float = 0.05,
-        epsilon_cooldown: int = 0,
-        soft_threshold: float = 0.0,
-        seed: Optional[int] = None,
-    ) -> None:
+    registry: Any
+    weight_store: Any = None
+    def __init__(self, registry: Any, weight_store: Optional[Any] = None, enable_fallback_allow: bool = True):
         self.registry = registry
         self.weight_store = weight_store
-        self.epsilon = float(epsilon)
-        self.epsilon_cooldown = int(epsilon_cooldown)
-        self.soft_threshold = float(soft_threshold)
+        self.enable_fallback_allow = enable_fallback_allow
 
-        self._rng = random.Random(seed)
-        self._cooldown_left = 0
-
-    def set_epsilon(self, epsilon: float, cooldown: Optional[int] = None) -> None:
-        self.epsilon = float(epsilon)
-        if cooldown is not None:
-            self.epsilon_cooldown = int(cooldown)
-
-    def _should_explore(self) -> bool:
-        if self.epsilon <= 0:
-            return False
-        if self._cooldown_left > 0:
-            self._cooldown_left -= 1
-            return False
-        if self._rng.random() < self.epsilon:
-            self._cooldown_left = max(0, int(self.epsilon_cooldown))
-            return True
-        return False
-
-    def _get_weight(self, expert_name: str, regime: Optional[str]) -> float:
-        ws = self.weight_store
-        if ws is None:
-            return 1.0
-
-        # try pair weight first (expert, regime)
-        if regime is not None:
+    def _iter_experts(self) -> List[Any]:
+        # Compatibility: registry may expose get_all / all / list / experts dict
+        if self.registry is None:
+            return []
+        if hasattr(self.registry, "get_all"):
             try:
-                w = ws.get(expert_name, regime)
-                return float(w)
-            except TypeError:
-                pass
+                return list(self.registry.get_all())
             except Exception:
                 pass
-
-        # fallback single-key weight (expert)
+        if hasattr(self.registry, "all"):
+            try:
+                return list(self.registry.all())
+            except Exception:
+                pass
+        if hasattr(self.registry, "experts"):
+            try:
+                # dict or list
+                exps = self.registry.experts
+                return list(exps.values()) if isinstance(exps, dict) else list(exps)
+            except Exception:
+                pass
+        return []
+    def _get_weight(self, expert_name: str, regime: str) -> float:
+        # default weight
+        w = 1.0
         try:
-            w = ws.get(expert_name)
-            return float(w)
+            if self.weight_store is not None and hasattr(self.weight_store, "get"):
+                w = float(self.weight_store.get(expert_name, regime))
         except Exception:
-            return 1.0
+            w = 1.0
+        # safety clamp
+        if not (w == w):  # NaN
+            w = 1.0
+        if w <= 0:
+            w = 1.0
+        return w
 
     def pick(
         self,
-        trade_features: Dict[str, Any],
-        context: Dict[str, Any],
-    ) -> Tuple[ExpertDecision, List[ExpertDecision]]:
-        """
-        Returns:
-          - best_decision: ExpertDecision
-          - all_decisions: List[ExpertDecision]  (raw per expert)
-        """
-        experts = self.registry.get_all()
-        if not experts:
-            best = ExpertDecision(
-                allow=False,
-                score=0.0,
-                expert="NO_EXPERT",
-                meta={"reason": "registry empty"},
-            )
-            return best, [best]
+        features: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[ExpertDecision], List[ExpertDecision]]:
+        context = context or {}
 
-        regime = None
+        regime = str(context.get("regime") or "unknown")
+
+        decisions: List[ExpertDecision] = []
+
+        # --- Iterate experts safely
         try:
-            regime = context.get("regime")
+            experts = list(self.registry.get_all()) if hasattr(self.registry, "get_all") else []
         except Exception:
-            regime = None
-
-        all_decisions: List[ExpertDecision] = []
-        scored: List[Tuple[float, ExpertDecision]] = []
+            experts = []
 
         for exp in experts:
-            name = getattr(exp, "name", exp.__class__.__name__)
+            name = getattr(exp, "name", None) or exp.__class__.__name__
             try:
-                raw = exp.decide(trade_features, context)
+                raw = exp.decide(features, context)
                 dec = coerce_decision(raw, fallback_expert=str(name))
             except Exception as e:
                 dec = ExpertDecision(
-                    allow=False,
-                    score=0.0,
                     expert=str(name),
-                    meta={"error": repr(e)},
+                    score=0.0,
+                    allow=False,
+                    action="hold",
+                    meta={"error": repr(e), "regime": regime},
                 )
 
-            all_decisions.append(dec)
+            if dec is None:
+                continue
 
-            w = self._get_weight(dec.expert, regime)
-            adj = float(dec.score) * float(w)
-            # keep weight inside meta for debugging
-            dec.meta = dict(dec.meta or {})
-            dec.meta.setdefault("weight", float(w))
-            dec.meta.setdefault("adj_score", float(adj))
+            # Weight adjust
+            w = self._get_weight(str(name), regime)
+            raw_score = float(getattr(dec, "score", 0.0) or 0.0)
+            adj = raw_score * w
 
-            scored.append((adj, dec))
+            # If expert didn't set allow, infer from score (keep backward compatibility)
+            allow = bool(getattr(dec, "allow", False))
+            if allow is False and raw_score > 0:
+                # optional: treat positive score as allow
+                allow = True
 
-        # Exploration: pick random among candidates (prefer allow if any)
-        if self._should_explore():
-            allow_candidates = [d for d in all_decisions if d.allow]
-            chosen = self._rng.choice(allow_candidates or all_decisions)
-            return chosen, all_decisions
-
-        # Exploitation: choose best adjusted score (prefer allow if soft_threshold requires)
-        scored.sort(key=lambda x: x[0], reverse=True)
-        best_adj, best_dec = scored[0]
-
-        # Optional: if best is not allow and you want "soft threshold" to force explore/deny,
-        # keep it simple: only allow if it passes threshold.
-        if self.soft_threshold > 0 and best_adj < self.soft_threshold:
-            # below threshold -> deny
-            best_dec = ExpertDecision(
-                allow=False,
-                score=float(best_dec.score),
-                expert=str(best_dec.expert),
-                meta={**(best_dec.meta or {}), "reason": "below_soft_threshold"},
+            action = str(getattr(dec, "action", "hold") or "hold")
+            meta = dict(getattr(dec, "meta", {}) or {})
+            meta.update(
+                {
+                    "raw_score": raw_score,
+                    "w": w,
+                    "regime": regime,
+                }
             )
 
-        return best_dec, all_decisions
+            decisions.append(
+                ExpertDecision(
+                    expert=str(name),
+                    score=float(adj),
+                    allow=bool(allow),
+                    action=action,
+                    meta=meta,
+                )
+            )
+
+        # --- No decisions at all
+        if not decisions:
+            fb = ExpertDecision(
+                expert="FALLBACK",
+                score=0.01,
+                allow=True,
+                action="hold",
+                meta={"reason": "no_expert_decisions", "regime": regime},
+            )
+            return fb, [fb]
+
+        # --- Sort by score desc
+        decisions.sort(key=lambda d: float(getattr(d, "score", 0.0) or 0.0), reverse=True)
+
+        # --- If everyone denied -> inject fallback allow=True and re-pick best
+        if not any(bool(getattr(d, "allow", False)) for d in decisions):
+            fb = ExpertDecision(
+                expert="FALLBACK",
+                score=0.01,
+                allow=True,
+                action="hold",
+                meta={"reason": "all_experts_denied", "regime": regime},
+            )
+            decisions.append(fb)
+            decisions.sort(key=lambda d: float(getattr(d, "score", 0.0) or 0.0), reverse=True)
+
+        best_dec = decisions[0] if decisions else None
+        return best_dec, decisions

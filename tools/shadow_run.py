@@ -13,6 +13,7 @@ from brain.journal import Journal
 from brain.trade_memory import TradeMemory
 from brain.reinforcement_learner import ReinforcementLearner
 from brain.weight_store import WeightStore
+
 from observer.outcome_updater import OutcomeUpdater
 
 # Optional: evaluation reporter (5.1.1)
@@ -76,19 +77,17 @@ def _weight_pair_count(ws: Optional[WeightStore]) -> int:
         return sum(len(sub) for sub in d.values())
     except Exception:
         try:
-            return len(ws)
+            return len(ws)  # type: ignore
         except Exception:
             return 0
 
 
 def main():
     ap = argparse.ArgumentParser()
-
     ap.add_argument("--csv", required=True)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--lookback", type=int, default=300)
     ap.add_argument("--max-steps", type=int, default=2000)
-
     ap.add_argument("--train", action="store_true")
     ap.add_argument("--horizon", type=int, default=30)
 
@@ -115,7 +114,7 @@ def main():
     # Weight store
     weight_store: Optional[WeightStore] = None
     if args.weights:
-        # IMPORTANT: init with path => auto-load if file exists
+        # init with path => auto-load if file exists
         weight_store = WeightStore(path=args.weights)
 
     # Reporter (optional)
@@ -128,15 +127,15 @@ def main():
         except Exception:
             reporter = None
 
-    # Training components
     trade_memory = TradeMemory() if args.train else None
+
     learner = None
     outcome_updater = None
     if args.train:
         learner = ReinforcementLearner(weight_store=weight_store)
         outcome_updater = OutcomeUpdater(
             learner=learner,
-            trade_memory=trade_memory,  # required
+            trade_memory=trade_memory,
             weight_store=weight_store,
             weights_path=args.weights,
             autosave=True,

@@ -2,323 +2,289 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 
-def _now_ts() -> float:
-    return time.time()
-
-
-def _safe_float(x: Any, default: float = 1.0) -> float:
+def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
-        return float(x)
+        if x is None:
+            return default
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
     except Exception:
-        return float(default)
+        return default
 
 
 @dataclass
-class WeightStoreConfig:
-    # hard clamp
-    min_w: float = 0.20
-    max_w: float = 5.00
-
-    # learning rate (base)
-    lr: float = 0.05
-
-    # mild decay back toward 1.0 each update
-    decay: float = 0.0005
-
-    # periodic persistence
-    autosave_every_updates: int = 50
-
-    # logging
-    log_every_updates: int = 200
-    top_k_log: int = 5
+class WeightUpdate:
+    key: str
+    prev: float
+    new: float
+    delta: float
+    meta: Dict[str, Any]
 
 
 class WeightStore:
     """
-    WeightStore:
-    - stores weights by bucket/key (nested dict)
-    - for 5.0.8.9: treat (expert, regime) as (bucket, key)
-      e.g. bucket="London", key="trend_up" (or any regime id)
+    Stores adaptive weights for:
+      - session bucket weights (e.g. London, NY...)
+      - pattern weights (e.g. Engulf...)
+      - structure weights (e.g. BOS, FVG...)
+      - trend/regime weights (e.g. range/trend/breakout...)
+      - expert-regime pair weights: key = f"{expert}|{regime}"
 
-    JSON format:
-    {
-      "bucketA": {"key1": 1.05, "key2": 0.97},
-      "bucketB": {"keyX": 1.20}
-    }
+    Design goals:
+      - Backward compatible with previous versions
+      - Works even if file missing/corrupted
+      - Supports update, decay, normalization, snapshots
     """
 
     def __init__(
         self,
         path: Optional[str] = None,
-        *,
-        cfg: Optional[WeightStoreConfig] = None,
-        min_w: Optional[float] = None,
-        max_w: Optional[float] = None,
-        lr: Optional[float] = None,
-        decay: Optional[float] = None,
-        autosave_every_updates: Optional[int] = None,
-        log_every_updates: Optional[int] = None,
-        top_k_log: Optional[int] = None,
-        **_kwargs: Any,  # accept unknown args to avoid breaking callers
+        data: Optional[Dict[str, Any]] = None,
+        clamp_min: float = 0.1,
+        clamp_max: float = 10.0,
+        decay: float = 0.9995,
+        normalize: bool = True,
     ) -> None:
-        self.path = path
-        self.cfg = cfg or WeightStoreConfig()
+        self.path = str(path) if path else None
+        self.clamp_min = float(clamp_min)
+        self.clamp_max = float(clamp_max)
+        self.decay = float(decay)
+        self.normalize = bool(normalize)
 
-        # allow overrides
-        if min_w is not None:
-            self.cfg.min_w = float(min_w)
-        if max_w is not None:
-            self.cfg.max_w = float(max_w)
-        if lr is not None:
-            self.cfg.lr = float(lr)
-        if decay is not None:
-            self.cfg.decay = float(decay)
-        if autosave_every_updates is not None:
-            self.cfg.autosave_every_updates = int(autosave_every_updates)
-        if log_every_updates is not None:
-            self.cfg.log_every_updates = int(log_every_updates)
-        if top_k_log is not None:
-            self.cfg.top_k_log = int(top_k_log)
+        # main container
+        self.weights: Dict[str, Any] = data if isinstance(data, dict) else {
+            "session": {},
+            "pattern": {},
+            "structure": {},
+            "trend": {},
+            "expert_regime": {},  # expert|regime -> float
+            "meta": {
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "version": "5.1.7",
+            },
+        }
 
-        self._w: Dict[str, Dict[str, float]] = {}
-        self._updates_since_save = 0
-        self._updates_since_log = 0
-        self._last_loaded_ts: Optional[float] = None
+        # ensure required keys exist
+        for k in ["session", "pattern", "structure", "trend", "expert_regime", "meta"]:
+            if k not in self.weights or not isinstance(self.weights[k], dict):
+                self.weights[k] = {} if k != "meta" else {"updated_at": time.time()}
 
-        if self.path and os.path.exists(self.path):
-            self.load(self.path)
+        self._last_snapshot_ts: float = 0.0
 
-    # ------------------------
-    # Compatibility / helpers
-    # ------------------------
-    @property
-    def weights(self) -> Dict[str, Dict[str, float]]:
-        # keep backward compat for any code referencing .weights
-        return self._w
+    # -----------------------------
+    # IO
+    # -----------------------------
+    @classmethod
+    def load(cls, path: str, **kwargs) -> "WeightStore":
+        """
+        Preferred loader. Safe if file missing.
+        """
+        if not path:
+            return cls(path=None, **kwargs)
 
-    def __len__(self) -> int:
-        # total number of (bucket,key) pairs
-        return sum(len(sub) for sub in self._w.values())
+        p = Path(path)
+        if not p.exists():
+            return cls(path=str(p), **kwargs)
 
-    def to_dict(self) -> Dict[str, Dict[str, float]]:
-        """Export weights as plain dict for logging/debug/report."""
-        out: Dict[str, Dict[str, float]] = {}
-        for bucket, mp in self._w.items():
-            out[str(bucket)] = {str(k): float(v) for k, v in mp.items()}
-        return out
-
-    as_dict = to_dict  # alias
-
-    # ------------------------
-    # Persistence
-    # ------------------------
-    def load(self, path: Optional[str] = None) -> None:
-        p = path or self.path
-        if not p:
-            return
-        if not os.path.exists(p):
-            return
-
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-
-        out: Dict[str, Dict[str, float]] = {}
-        if isinstance(data, dict):
-            for bucket, sub in data.items():
-                if isinstance(sub, dict):
-                    out[str(bucket)] = {str(k): _safe_float(v, 1.0) for k, v in sub.items()}
-
-        self._w = out
-        self._last_loaded_ts = _now_ts()
+        try:
+            raw = p.read_text(encoding="utf-8")
+            data = json.loads(raw) if raw.strip() else {}
+            return cls(path=str(p), data=data, **kwargs)
+        except Exception:
+            # fallback: corrupted file -> start fresh but keep path
+            return cls(path=str(p), **kwargs)
 
     def save(self, path: Optional[str] = None) -> None:
-        p = path or self.path
-        if not p:
+        out = str(path) if path else self.path
+        if not out:
             return
+        p = Path(out)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        self.weights.setdefault("meta", {})
+        self.weights["meta"]["updated_at"] = time.time()
+        p.write_text(json.dumps(self.weights, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(self._w, f, indent=2, sort_keys=True)
+    # backward compat
+    def load_json(self, path: Optional[str] = None) -> "WeightStore":
+        """
+        Backward compatible alias used by older scripts.
+        Mutates self to load file.
+        """
+        src = path or self.path
+        if not src:
+            return self
+        loaded = WeightStore.load(src, clamp_min=self.clamp_min, clamp_max=self.clamp_max, decay=self.decay, normalize=self.normalize)
+        self.path = loaded.path
+        self.weights = loaded.weights
+        return self
 
-        self._updates_since_save = 0
+    def save_json(self, path: Optional[str] = None) -> None:
+        """
+        Backward compatible alias used by older scripts.
+        """
+        self.save(path)
 
-    def load_json(self, path: str) -> bool:
-        try:
-            self.load(path)
-            return True
-        except Exception:
-            return False
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Used by shadow_run debug / eval reporter snapshot.
+        """
+        return self.weights
 
-    def save_json(self, path: str) -> bool:
-        try:
-            self.save(path)
-            return True
-        except Exception:
-            return False
+    # -----------------------------
+    # Get/Set helpers
+    # -----------------------------
+    def _bucket(self, bucket: str) -> Dict[str, float]:
+        b = self.weights.get(bucket)
+        if not isinstance(b, dict):
+            b = {}
+            self.weights[bucket] = b
+        return b  # type: ignore[return-value]
 
-    # ------------------------
-    # Core accessors
-    # ------------------------
-    def get(self, bucket: str, key: str, default: float = 1.0) -> float:
-        b = self._w.get(str(bucket))
-        if not b:
-            return float(default)
-        return _safe_float(b.get(str(key), default), default)
+    def get(self, key: str, regime: Optional[str] = None, default: float = 1.0) -> float:
+        """
+        Unified getter:
+          - if regime provided -> expert_regime weight with key = f"{key}|{regime}"
+          - else try to find key in known buckets, else default
+        """
+        if regime:
+            k = f"{key}|{regime}"
+            v = self._bucket("expert_regime").get(k, default)
+            return _safe_float(v, default)
+
+        # search across buckets
+        for bucket in ("session", "pattern", "structure", "trend"):
+            b = self._bucket(bucket)
+            if key in b:
+                return _safe_float(b.get(key), default)
+
+        # expert_regime by raw key if exists
+        if key in self._bucket("expert_regime"):
+            return _safe_float(self._bucket("expert_regime").get(key), default)
+
+        return float(default)
 
     def set(self, bucket: str, key: str, value: float) -> None:
-        b = self._w.setdefault(str(bucket), {})
-        b[str(key)] = self._clamp(float(value))
+        b = self._bucket(bucket)
+        b[key] = float(value)
+        self.weights.setdefault("meta", {})
+        self.weights["meta"]["updated_at"] = time.time()
 
-    def ensure(self, bucket: str, key: str, default: float = 1.0) -> float:
-        b = self._w.setdefault(str(bucket), {})
-        k = str(key)
-        if k not in b:
-            b[k] = self._clamp(float(default))
-        return b[k]
+    # -----------------------------
+    # Learning / Update logic
+    # -----------------------------
+    def apply_decay(self) -> None:
+        """
+        Decay weights gently toward 1.0 to prevent runaway.
+        """
+        d = float(self.decay)
+        if d <= 0.0 or d >= 1.0:
+            return
 
-    # ------------------------
-    # Learning update
-    # ------------------------
-    def update(
+        for bucket in ("session", "pattern", "structure", "trend", "expert_regime"):
+            b = self._bucket(bucket)
+            for k, v in list(b.items()):
+                fv = _safe_float(v, 1.0)
+                # move toward 1.0
+                b[k] = 1.0 + (fv - 1.0) * d
+
+    def clamp_all(self) -> None:
+        mn, mx = self.clamp_min, self.clamp_max
+        for bucket in ("session", "pattern", "structure", "trend", "expert_regime"):
+            b = self._bucket(bucket)
+            for k, v in list(b.items()):
+                fv = _safe_float(v, 1.0)
+                if fv < mn:
+                    fv = mn
+                if fv > mx:
+                    fv = mx
+                b[k] = fv
+
+    def normalize_bucket(self, bucket: str) -> None:
+        """
+        Optional: normalize weights to have mean ~= 1.0
+        """
+        b = self._bucket(bucket)
+        if not b:
+            return
+        vals = [_safe_float(v, 1.0) for v in b.values()]
+        if not vals:
+            return
+        mean = sum(vals) / max(1, len(vals))
+        if mean <= 0:
+            return
+        for k, v in list(b.items()):
+            b[k] = _safe_float(v, 1.0) / mean
+
+    def normalize_all(self) -> None:
+        if not self.normalize:
+            return
+        for bucket in ("session", "pattern", "structure", "trend", "expert_regime"):
+            self.normalize_bucket(bucket)
+
+    def update_weight(
         self,
         bucket: str,
         key: str,
-        reward: float,
-        *,
-        lr: Optional[float] = None,
-        decay: Optional[float] = None,
-        min_w: Optional[float] = None,
-        max_w: Optional[float] = None,
-        normalize_bucket: bool = False,
-        target_mean: float = 1.0,
-        autosave: Optional[bool] = None,
-        log: bool = False,
-    ) -> float:
-        _lr = float(lr) if lr is not None else float(self.cfg.lr)
-        _decay = float(decay) if decay is not None else float(self.cfg.decay)
-        _min = float(min_w) if min_w is not None else float(self.cfg.min_w)
-        _max = float(max_w) if max_w is not None else float(self.cfg.max_w)
+        delta: float,
+        lr: float = 0.05,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> WeightUpdate:
+        """
+        Core update: w <- w + lr * delta
+        delta should be positive for good outcomes, negative for bad outcomes.
+        """
+        b = self._bucket(bucket)
+        prev = _safe_float(b.get(key, 1.0), 1.0)
+        new = prev + float(lr) * float(delta)
+        b[key] = new
+        upd = WeightUpdate(key=key, prev=prev, new=new, delta=float(delta), meta=meta or {})
+        self.weights.setdefault("meta", {})
+        self.weights["meta"]["updated_at"] = time.time()
+        return upd
 
-        b = str(bucket)
-        k = str(key)
-
-        cur = self.ensure(b, k, default=1.0)
-        r = _safe_float(reward, 0.0)
-
-        nxt = cur + (_lr * r)
-        nxt = nxt + (_decay * (1.0 - nxt))
-        nxt = max(_min, min(_max, float(nxt)))
-
-        self._w[b][k] = nxt
-
-        if normalize_bucket:
-            self._normalize_bucket(b, target_mean=float(target_mean), min_w=_min, max_w=_max)
-
-        self._updates_since_save += 1
-        self._updates_since_log += 1
-
-        do_autosave = (
-            self.cfg.autosave_every_updates > 0
-            and (self._updates_since_save >= self.cfg.autosave_every_updates)
-        )
-        if autosave is not None:
-            do_autosave = bool(autosave)
-        if do_autosave:
-            self.save()
-
-        do_log = log or (
-            self.cfg.log_every_updates > 0 and (self._updates_since_log >= self.cfg.log_every_updates)
-        )
-        if do_log:
-            self._updates_since_log = 0
-            self.log_summary(title=f"WeightStore summary (last update: {b}/{k})")
-
-        return nxt
-
-    # ------------------------
-    # Stabilization helpers
-    # ------------------------
-    def clamp_all(self, *, min_w: Optional[float] = None, max_w: Optional[float] = None) -> None:
-        _min = float(min_w) if min_w is not None else float(self.cfg.min_w)
-        _max = float(max_w) if max_w is not None else float(self.cfg.max_w)
-        for _, sub in self._w.items():
-            for k, v in list(sub.items()):
-                sub[k] = max(_min, min(_max, _safe_float(v, 1.0)))
-
-    def decay_all(self, rate: Optional[float] = None) -> None:
-        r = float(rate) if rate is not None else float(self.cfg.decay)
-        if r <= 0:
-            return
-        for _, sub in self._w.items():
-            for k, v in list(sub.items()):
-                vv = _safe_float(v, 1.0)
-                vv = vv + r * (1.0 - vv)
-                sub[k] = self._clamp(vv)
-
-    def normalize_all(self, target_mean: float = 1.0) -> None:
-        for b in list(self._w.keys()):
-            self._normalize_bucket(b, target_mean=target_mean)
-
-    def _normalize_bucket(
+    def update_expert_regime(
         self,
-        bucket: str,
-        *,
-        target_mean: float = 1.0,
-        min_w: Optional[float] = None,
-        max_w: Optional[float] = None,
-    ) -> None:
-        b = self._w.get(bucket)
-        if not b:
-            return
-        vals = [float(_safe_float(v, 1.0)) for v in b.values()]
-        if not vals:
-            return
+        expert: str,
+        regime: str,
+        delta: float,
+        lr: float = 0.05,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> WeightUpdate:
+        k = f"{expert}|{regime}"
+        return self.update_weight("expert_regime", k, delta=delta, lr=lr, meta=meta)
 
-        cur_mean = sum(vals) / max(1, len(vals))
-        if cur_mean <= 1e-9:
-            return
+    def maybe_snapshot(self, out_dir: str = "data", every_sec: int = 60) -> Optional[str]:
+        """
+        Periodic snapshot logging used earlier (5.0.8.6+).
+        Writes: data/weights_snapshot_<ts>.json
+        """
+        now = time.time()
+        if (now - self._last_snapshot_ts) < float(every_sec):
+            return None
+        self._last_snapshot_ts = now
 
-        ratio = float(target_mean) / cur_mean
-        _min = float(min_w) if min_w is not None else float(self.cfg.min_w)
-        _max = float(max_w) if max_w is not None else float(self.cfg.max_w)
+        p = Path(out_dir) / f"weights_snapshot_{int(now)}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(self.weights, indent=2, ensure_ascii=False), encoding="utf-8")
+        return str(p)
 
-        for k, v in list(b.items()):
-            nv = float(_safe_float(v, 1.0)) * ratio
-            b[k] = max(_min, min(_max, nv))
-
-    def _clamp(self, v: float) -> float:
-        return max(float(self.cfg.min_w), min(float(self.cfg.max_w), float(v)))
-
-    # ------------------------
-    # Logging
-    # ------------------------
-    def log_summary(self, title: str = "WeightStore summary") -> None:
-        flat: list[Tuple[str, str, float]] = []
-        for b, sub in self._w.items():
-            for k, v in sub.items():
-                flat.append((b, k, _safe_float(v, 1.0)))
-
-        if not flat:
-            print(f"[WeightStore] {title}: (empty)")
-            return
-
-        flat.sort(key=lambda x: x[2], reverse=True)
-        kk = max(1, int(self.cfg.top_k_log))
-
-        top = flat[:kk]
-        bottom = list(reversed(flat[-kk:]))
-
-        print(f"\n[WeightStore] {title}")
-        print(" Top:")
-        for b, k, v in top:
-            print(f"  {b} / {k} = {v:.4f}")
-        print(" Bottom:")
-        for b, k, v in bottom:
-            print(f"  {b} / {k} = {v:.4f}")
-        print("")
+    def size(self) -> int:
+        """
+        Count total number of scalar weights.
+        """
+        total = 0
+        for bucket in ("session", "pattern", "structure", "trend", "expert_regime"):
+            b = self._bucket(bucket)
+            total += len(b)
+        return total

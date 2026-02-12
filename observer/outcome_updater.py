@@ -9,29 +9,33 @@ from brain.trade_memory import TradeMemory
 class OutcomeUpdater:
     """
     Consumes trade outcomes and updates:
-      - ReinforcementLearner (existing behavior)
-      - WeightStore (5.0.8.x), now with 5.0.8.9: expert-regime pair updates
+    - ReinforcementLearner (existing behavior)
+    - WeightStore (5.0.8.x), now with 5.0.8.9+: expert-regime pair updates
     """
 
     def __init__(
         self,
-        learner: Any,
-        trade_memory: TradeMemory,
+        learner: Any = None,
+        trade_memory: Optional[TradeMemory] = None,
         weight_store: Optional[Any] = None,
         weights_path: Optional[str] = None,
         autosave: bool = True,
+        **kwargs,  # IMPORTANT: keep backward/forward compatibility across versions
     ) -> None:
         self.learner = learner
         self.trade_memory = trade_memory
         self.weight_store = weight_store
         self.weights_path = weights_path
         self.autosave = bool(autosave)
-
         self._updates = 0
 
-        # if WeightStore passed without path but weights_path provided
+        # If WeightStore passed without path but weights_path provided
         try:
-            if self.weight_store is not None and getattr(self.weight_store, "path", None) is None and self.weights_path:
+            if (
+                self.weight_store is not None
+                and getattr(self.weight_store, "path", None) is None
+                and self.weights_path
+            ):
                 self.weight_store.path = self.weights_path
         except Exception:
             pass
@@ -39,11 +43,11 @@ class OutcomeUpdater:
     def on_outcome(self, snapshot: Dict[str, Any]) -> None:
         """
         snapshot is expected to include (best effort):
-          - pnl (float)
-          - win (bool) OR pnl sign
-          - risk_cfg: {"expert": "...", "regime": "..."}  (preferred)
-          - meta: may contain {"expert": "..."} etc.
-          - forced (bool)
+        - pnl (float)
+        - win (bool) OR pnl sign
+        - risk_cfg: {"expert": "...", "regime": "..."} (preferred)
+        - meta: may contain {"expert": "..."} etc.
+        - forced (bool)
         """
         self._updates += 1
 
@@ -70,13 +74,11 @@ class OutcomeUpdater:
             reward *= 0.50
 
         # optional scaling by ATR (if present)
-        # if you later add atr field, this keeps stable (no crash)
         atr = snapshot.get("atr", None)
         if atr is not None:
             try:
                 atr = float(atr)
                 if atr > 0:
-                    # mild scaling to reduce overreaction under high vol
                     reward = reward / (1.0 + 0.1 * atr)
             except Exception:
                 pass
@@ -122,21 +124,27 @@ class OutcomeUpdater:
         if pnl is not None:
             try:
                 pnl_f = float(pnl)
+
                 # compress to keep stable:
                 # sign(pnl) * min(1, abs(pnl)/scale)
                 scale = float(snapshot.get("reward_scale", 1.0))
                 if scale <= 0:
                     scale = 1.0
+
                 mag = min(1.0, abs(pnl_f) / scale)
-                return (1.0 if pnl_f > 0 else (-1.0 if pnl_f < 0 else 0.0)) * mag
+                if pnl_f > 0:
+                    return 1.0 * mag
+                if pnl_f < 0:
+                    return -1.0 * mag
+                return 0.0
             except Exception:
                 pass
 
         # fallback to win/loss
         win = snapshot.get("win", None)
         if win is None:
-            # try outcome field
             win = snapshot.get("outcome", None)
+
         if isinstance(win, bool):
             return 1.0 if win else -1.0
 
