@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from brain.experts.expert_base import BaseExpert, ExpertDecision
+from brain.experts.expert_base import ExpertBase, ExpertDecision
 
 
-class TrendMAExpert(BaseExpert):
+class TrendMAExpert(ExpertBase):
     name = "TREND_MA"
 
     def evaluate(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
@@ -30,7 +30,7 @@ class TrendMAExpert(BaseExpert):
                               meta={"ma_fast": ma_fast, "ma_slow": ma_slow, "regime": context.get("regime")})
 
 
-class MeanRevertExpert(BaseExpert):
+class MeanRevertExpert(ExpertBase):
     name = "MEAN_REVERT"
     def evaluate(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
         candles: List[Dict[str, Any]] = trade_features.get("candles") or []
@@ -49,7 +49,7 @@ class MeanRevertExpert(BaseExpert):
                               meta={"mean": mean, "last": last, "dist": dist, "regime": context.get("regime")})
 
 
-class BreakoutExpert(BaseExpert):
+class BreakoutExpert(ExpertBase):
     name = "BREAKOUT"
     def evaluate(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
         candles: List[Dict[str, Any]] = trade_features.get("candles") or []
@@ -67,8 +67,25 @@ class BreakoutExpert(BaseExpert):
         allow = score >= 0.8
         return ExpertDecision(allow=allow, score=min(score, 1.0), expert=self.name,
                               meta={"hi": hi, "lo": lo, "last": last, "regime": context.get("regime")})
+
+
 # ✅ để DecisionEngine/ExpertRegistry có thể “register default” rất tiện
 DEFAULT_EXPERTS = [TrendMAExpert(), MeanRevertExpert(), BreakoutExpert()]
+
+class BaselineExpert(ExpertBase):
+    name = "BASELINE"
+
+    def decide(self, features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
+        # Cho phép decision để engine không deny 100%
+        return ExpertDecision(
+            allow=True,
+            score=0.0,
+            expert=self.name,
+            meta={"reason": "baseline"},
+            action="hold",   # nếu hệ thống của bro có dùng action
+        )
+
+DEFAULT_EXPERTS: List[ExpertBase] = [BaselineExpert()]
 
 def register_basic_experts(registry: Any) -> None:
     """
