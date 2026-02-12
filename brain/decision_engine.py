@@ -283,6 +283,7 @@ class DecisionEngine:
                 meta = None
 
         # risk_cfg is what OutcomeUpdater uses later
+        regime = str(context.get("regime", "UNKNOWN"))
         risk_cfg: Dict[str, Any] = {
             "expert": expert_name,
             "regime": regime,
@@ -290,8 +291,11 @@ class DecisionEngine:
         }
         if meta:
             risk_cfg["meta"] = meta
-
-        # Meta post-hook
+            
+        meta = meta or {}
+        meta["regime"] = regime
+        meta["expert"] = expert_name
+                # Meta post-hook
         if self.meta is not None and hasattr(self.meta, "post_decision"):
             try:
                 self.meta.post_decision(
