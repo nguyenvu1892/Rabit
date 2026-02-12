@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-
+from brain.experts.expert_gate import ExpertGate
 
 @dataclass
 class EngineDecision:
@@ -271,7 +271,6 @@ class DecisionEngine:
         print("DEBUG BEST_SCORE:", getattr(best, "score", None))
         print("DEBUG BEST_EXPERT:", getattr(best, "expert", None))
         print("DEBUG BEST_META:", getattr(best, "meta", None))
-        # Normalize best decision shape
         if isinstance(best, dict):
             allow = bool(best.get("allow", False))
             score = float(best.get("score", 0.0))

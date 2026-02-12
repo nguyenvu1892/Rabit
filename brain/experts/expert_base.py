@@ -1,82 +1,91 @@
-# brain/experts/expert_base.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, Optional, Protocol, Union
 
 
 @dataclass
 class ExpertDecision:
     """
-    Output of an expert decision.
-
-    - allow: should enter a trade
-    - score: confidence/utility score (higher is better)
-    - expert: expert name
-    - meta: optional extra info (signals, thresholds, etc.)
+    Normalized decision object returned by experts / gate.
+    Keep fields stable for the rest of the system.
     """
-    allow: bool
-    score: float
     expert: str
+    score: float = 0.0
+    allow: bool = False
+    action: str = "hold"  # "buy"/"sell"/"hold"
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
-class ExpertBase(Protocol):
+class BaseExpert(Protocol):
     """
-    Protocol (no inheritance needed) to avoid circular imports.
-    Any expert class that has:
-      - name: str
-      - decide(trade_features, context) -> ExpertDecision | dict | tuple
-    is compatible.
+    Minimal interface for an Expert.
     """
     name: str
-    # Backward compatibility: older modules import BaseExpert
-    BaseExpert = ExpertBase
 
-    __all__ = [
-        "ExpertDecision",
-        "ExpertBase",
-        "BaseExpert",
-    ]
-
-    def decide(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> Any:
+    def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Any:
         ...
 
 
-def coerce_decision(obj: Any, fallback_expert: str) -> ExpertDecision:
-    """
-    Normalize different expert outputs into ExpertDecision.
-    Supports:
-      - ExpertDecision
-      - dict {allow, score, meta?, expert?}
-      - tuple/list (allow, score) or (allow, score, meta)
-    """
-    if isinstance(obj, ExpertDecision):
-        if not obj.expert:
-            obj.expert = fallback_expert
-        return obj
+# Backward-compatible alias (some modules import ExpertBase)
+ExpertBase = BaseExpert
 
-    if isinstance(obj, dict):
-        allow = bool(obj.get("allow", False))
-        score = float(obj.get("score", 0.0))
-        expert = str(obj.get("expert") or fallback_expert)
-        meta = obj.get("meta") or {}
-        if not isinstance(meta, dict):
-            meta = {"meta": meta}
-        return ExpertDecision(allow=allow, score=score, expert=expert, meta=meta)
 
-    if isinstance(obj, (tuple, list)) and len(obj) >= 2:
-        allow = bool(obj[0])
-        score = float(obj[1])
-        meta: Optional[Dict[str, Any]] = None
-        if len(obj) >= 3 and isinstance(obj[2], dict):
-            meta = obj[2]
+def coerce_decision(raw: Any, fallback_expert: str = "UNKNOWN") -> Optional[ExpertDecision]:
+    """
+    Convert arbitrary expert output -> ExpertDecision.
+
+    Accepts:
+    - ExpertDecision
+    - dict: {"score":..., "allow":..., "action":..., "meta":..., "expert":...}
+    - tuple/list: (score, allow) or (score, allow, action)
+    - numeric: score (allow inferred score > 0)
+    - None -> None
+    """
+    if raw is None:
+        return None
+
+    if isinstance(raw, ExpertDecision):
+        return raw
+
+    # dict payload
+    if isinstance(raw, dict):
+        expert = str(raw.get("expert", fallback_expert))
+        score = float(raw.get("score", 0.0) or 0.0)
+        allow = bool(raw.get("allow", score > 0))
+        action = str(raw.get("action", "hold") or "hold")
+        meta = raw.get("meta") or {}
+        # merge extra keys into meta (optional)
+        extra = {k: v for k, v in raw.items() if k not in {"expert", "score", "allow", "action", "meta"}}
+        if extra:
+            meta = {**meta, **extra}
+        return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=meta)
+
+    # tuple/list
+    if isinstance(raw, (tuple, list)) and len(raw) >= 2:
+        score = float(raw[0] or 0.0)
+        allow = bool(raw[1])
+        action = str(raw[2]) if len(raw) >= 3 and raw[2] is not None else "hold"
+        return ExpertDecision(expert=str(fallback_expert), score=score, allow=allow, action=action, meta={})
+
+    # numeric score
+    if isinstance(raw, (int, float)):
+        score = float(raw)
+        return ExpertDecision(expert=str(fallback_expert), score=score, allow=(score > 0), action="hold", meta={})
+
+    # unknown object -> try attribute access
+    try:
+        score = float(getattr(raw, "score"))
+        allow = bool(getattr(raw, "allow", score > 0))
+        action = str(getattr(raw, "action", "hold"))
+        expert = str(getattr(raw, "expert", fallback_expert))
+        meta = getattr(raw, "meta", {}) or {}
+        return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=dict(meta))
+    except Exception:
         return ExpertDecision(
-            allow=allow,
-            score=score,
-            expert=fallback_expert,
-            meta=meta or {},
+            expert=str(fallback_expert),
+            score=0.0,
+            allow=False,
+            action="hold",
+            meta={"coerce_error": repr(raw)},
         )
-
-    # fallback
-    return ExpertDecision(allow=False, score=0.0, expert=fallback_expert, meta={"raw": str(obj)})
