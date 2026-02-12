@@ -149,13 +149,21 @@ def main():
         weight_store=weight_store,
     )
 
-    runner = ShadowRunner(
-        de,
-        risk_engine=risk_engine,
+    runner_kwargs = dict(
+        weight_store=weight_store,
         outcome_updater=outcome_updater,
-        seed=args.seed,
+        reporter=reporter,
         train=args.train,
     )
+
+    # Try newer kw name first, fallback to older ones
+    try:
+        runner = ShadowRunner(de, risk_engine=risk_engine, **runner_kwargs)
+    except TypeError:
+        try:
+            runner = ShadowRunner(de, risk=risk_engine, **runner_kwargs)
+        except TypeError:
+            runner = ShadowRunner(de, risk_mgr=risk_engine, **runner_kwargs)
 
     stats = runner.run(
         candles=candles,
