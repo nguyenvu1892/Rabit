@@ -5,116 +5,50 @@ from typing import Any, Dict, Optional
 
 from brain.trade_memory import TradeMemory
 
-def _clip(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def _get_meta(decision: Any) -> Dict[str, Any]:
-    if decision is None:
-        return {}
-    if isinstance(decision, dict):
-        return decision.get("meta") or {}
-    return getattr(decision, "meta", None) or {}
-
-
-def _get_expert(decision: Any) -> str:
-    if decision is None:
-        return "UNKNOWN"
-    if isinstance(decision, dict):
-        return str(decision.get("expert") or "UNKNOWN")
-    return str(getattr(decision, "expert", "UNKNOWN"))
-
 
 class OutcomeUpdater:
     """
     Consumes trade outcomes and updates:
-      - ReinforcementLearner (existing behavior)
-      - WeightStore (expert-regime pair updates)
-
-    Snapshot expected (best-effort):
-      - pnl: float
-      - win: bool (optional)
-      - forced: bool (optional)
-      - atr: float (optional)
-      - conf: float in [0..1] (optional)
-      - risk_cfg: {"expert": str, "regime": str} (preferred)
-      - meta: may contain "expert"/"regime"
+    - ReinforcementLearner (existing behavior)
+    - WeightStore (5.0.8.x), now with 5.0.8.9+: expert-regime pair updates
     """
 
     def __init__(
         self,
-        learner: Any,
-        trade_memory: TradeMemory,
+        learner: Any = None,
+        trade_memory: Optional[TradeMemory] = None,
         weight_store: Optional[Any] = None,
         weights_path: Optional[str] = None,
         autosave: bool = True,
-        save_every: int = 25,          # <— avoid IO each trade
-        reward_scale: float = 1.0,     # pnl scaling
+        **kwargs,  # IMPORTANT: keep backward/forward compatibility across versions
     ) -> None:
         self.learner = learner
         self.trade_memory = trade_memory
         self.weight_store = weight_store
         self.weights_path = weights_path
         self.autosave = bool(autosave)
-        self.save_every = int(save_every)
-        self.reward_scale = float(reward_scale)
-
         self._updates = 0
 
-        # if WeightStore passed without path but weights_path provided
+        # If WeightStore passed without path but weights_path provided
         try:
-            if self.weight_store is not None and getattr(self.weight_store, "path", None) is None and self.weights_path:
+            if (
+                self.weight_store is not None
+                and getattr(self.weight_store, "path", None) is None
+                and self.weights_path
+            ):
                 self.weight_store.path = self.weights_path
         except Exception:
             pass
-    def update(self, decision: Any, pnl: float, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        context = context or {}
-        meta = _get_meta(decision)
-        expert = _get_expert(decision)
 
-        regime = str(context.get("regime", meta.get("regime", "unknown")))
-        bucket = context.get("bucket", meta.get("bucket"))
-
-        raw_score = _safe_float(meta.get("raw_score", meta.get("raw", 0.0)), 0.0)
-        w = _safe_float(meta.get("w", 1.0), 1.0)
-        adj_score = _safe_float(meta.get("adj_score", 0.0), 0.0)
-        if adj_score == 0.0 and raw_score != 0.0:
-            adj_score = raw_score * w
-
-        # confidence in [0.1..1.0] so learning never fully stops
-        confidence = _clip(abs(adj_score), 0.1, 1.0)
-        scaled_reward = _safe_float(pnl, 0.0) * confidence
-
-        # store for reporter/debug
-        meta["confidence"] = confidence
-        meta["scaled_reward"] = scaled_reward
-        meta["regime"] = regime
-        meta["bucket"] = bucket
-
-        # update weight_store with best-effort signature matching
-        if hasattr(self.weight_store, "update") and callable(getattr(self.weight_store, "update")):
-            try:
-                # update(expert, regime, reward, bucket)
-                self.weight_store.update(expert, regime, scaled_reward, bucket)
-            except TypeError:
-                try:
-                    # update(expert, regime, reward)
-                    self.weight_store.update(expert, regime, scaled_reward)
-                except TypeError:
-                    # update(key, reward)
-                    key = f"{regime}|{bucket}|{expert}" if bucket else f"{regime}|{expert}"
-                    self.weight_store.update(key, scaled_reward)
-
-        return meta
-        
     def on_outcome(self, snapshot: Dict[str, Any]) -> None:
+        """
+        snapshot is expected to include (best effort):
+        - pnl (float)
+        - win (bool) OR pnl sign
+        - risk_cfg: {"expert": "...", "regime": "..."} (preferred)
+        - meta: may contain {"expert": "..."} etc.
+        - forced (bool)
+        """
         self._updates += 1
 
         # 1) keep old learner update (best-effort)
@@ -124,7 +58,7 @@ class OutcomeUpdater:
         except Exception:
             pass
 
-        # 2) WeightStore update
+        # 2) WeightStore update (expert-regime)
         if self.weight_store is None:
             return
 
@@ -133,14 +67,6 @@ class OutcomeUpdater:
             return
 
         reward = self._reward_from_snapshot(snapshot)
-
-        # confidence scaling
-        conf = snapshot.get("conf", None)
-        try:
-            conf_f = float(conf) if conf is not None else 1.0
-        except Exception:
-            conf_f = 1.0
-        conf_f = max(0.0, min(1.0, conf_f))
 
         # optional penalty for forced exploration trades
         forced = bool(snapshot.get("forced", False))
@@ -157,32 +83,22 @@ class OutcomeUpdater:
             except Exception:
                 pass
 
-        # update expert-regime
         try:
-            # WeightStore signature supports conf/autosave/log (ours), but also tolerant if not
-            if hasattr(self.weight_store, "update"):
-                self.weight_store.update(
-                    expert,
-                    regime,
-                    reward,
-                    conf=conf_f,
-                    autosave=self.autosave,
-                    log=False,
-                )
-        except TypeError:
-            # fallback for older signature: update(bucket,key,delta, autosave=?, log=?)
-            try:
-                self.weight_store.update(expert, regime, reward, autosave=self.autosave, log=False)
-            except Exception:
-                return
+            self.weight_store.update(
+                expert,
+                regime,
+                reward,
+                autosave=self.autosave,
+                log=False,
+            )
         except Exception:
+            # do NOT crash the pipeline
             return
 
-        # explicit periodic save (safe)
-        if self.autosave and self.weights_path and (self._updates % max(1, self.save_every) == 0):
+        # optional explicit save path
+        if self.autosave and self.weights_path:
             try:
-                if hasattr(self.weight_store, "save"):
-                    self.weight_store.save(self.weights_path)
+                self.weight_store.save(self.weights_path)
             except Exception:
                 pass
 
@@ -200,7 +116,6 @@ class OutcomeUpdater:
             expert = str(expert)
         if regime is not None:
             regime = str(regime)
-
         return expert, regime
 
     def _reward_from_snapshot(self, snapshot: Dict[str, Any]) -> float:
@@ -209,9 +124,13 @@ class OutcomeUpdater:
         if pnl is not None:
             try:
                 pnl_f = float(pnl)
-                scale = float(snapshot.get("reward_scale", self.reward_scale) or self.reward_scale)
+
+                # compress to keep stable:
+                # sign(pnl) * min(1, abs(pnl)/scale)
+                scale = float(snapshot.get("reward_scale", 1.0))
                 if scale <= 0:
                     scale = 1.0
+
                 mag = min(1.0, abs(pnl_f) / scale)
                 if pnl_f > 0:
                     return 1.0 * mag
@@ -225,6 +144,8 @@ class OutcomeUpdater:
         win = snapshot.get("win", None)
         if win is None:
             win = snapshot.get("outcome", None)
+
         if isinstance(win, bool):
             return 1.0 if win else -1.0
+
         return 0.0
