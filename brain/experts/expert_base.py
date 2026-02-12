@@ -30,6 +30,14 @@ class ExpertBase(Protocol):
     is compatible.
     """
     name: str
+    # Backward compatibility: older modules import BaseExpert
+    BaseExpert = ExpertBase
+
+    __all__ = [
+        "ExpertDecision",
+        "ExpertBase",
+        "BaseExpert",
+    ]
 
     def decide(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> Any:
         ...

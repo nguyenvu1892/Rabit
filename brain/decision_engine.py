@@ -68,8 +68,8 @@ class DecisionEngine:
         - fallback baseline expert if registry stays empty
         """
         from brain.experts.expert_registry import ExpertRegistry
+        from brain.experts.experts_basic import DEFAULT_EXPERTS
         reg = ExpertRegistry()
-
         def _reg_add(expert_obj: Any) -> bool:
             for meth in ("register", "add", "add_expert", "register_expert"):
                 if hasattr(reg, meth):
@@ -267,7 +267,10 @@ class DecisionEngine:
                 pass
 
         best, _all_decisions = self.gate.pick(trade_features, context)
-
+        print("DEBUG BEST:", best)
+        print("DEBUG BEST_SCORE:", getattr(best, "score", None))
+        print("DEBUG BEST_EXPERT:", getattr(best, "expert", None))
+        print("DEBUG BEST_META:", getattr(best, "meta", None))
         # Normalize best decision shape
         if isinstance(best, dict):
             allow = bool(best.get("allow", False))
@@ -291,7 +294,7 @@ class DecisionEngine:
         }
         if meta:
             risk_cfg["meta"] = meta
-            
+
         meta = meta or {}
         meta["regime"] = regime
         meta["expert"] = expert_name
@@ -307,3 +310,4 @@ class DecisionEngine:
                 pass
 
         return allow, score, risk_cfg
+    

@@ -43,3 +43,9 @@ class ExpertRegistry:
 
     def __iter__(self):
         return iter(self._experts.values())
+
+    def all(self) -> List[ExpertBase]:
+        return self.get_all()
+
+    def values(self) -> List[ExpertBase]:
+        return self.get_all()

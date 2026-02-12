@@ -10,9 +10,9 @@ class TrendMAExpert(BaseExpert):
     name = "TREND_MA"
 
     def evaluate(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
-        candles: List[Dict[str, Any]] = trade_features.get("candles") or trade_features.get("window") or []
+        candles: List[Dict[str, Any]] = trade_features.get("candles") or []
         if len(candles) < 50:
-            return ExpertDecision(False, 0.0, self.name, {"reason": "not_enough_data"})
+            return ExpertDecision(False, 0.0, self.name, {"reason": "not_enough_data", "n": len(candles)})
 
         closes = [float(x.get("c", x.get("close"))) for x in candles[-50:]]
         ma_fast = sum(closes[-10:]) / 10.0
@@ -26,21 +26,16 @@ class TrendMAExpert(BaseExpert):
         if context.get("regime") == "trend":
             score += 0.15
 
-        return ExpertDecision(
-            allow=allow,
-            score=min(score, 1.0),
-            expert=self.name,
-            meta={"ma_fast": ma_fast, "ma_slow": ma_slow, "regime": context.get("regime")},
-        )
+        return ExpertDecision(allow=allow, score=min(score, 1.0), expert=self.name,
+                              meta={"ma_fast": ma_fast, "ma_slow": ma_slow, "regime": context.get("regime")})
 
 
 class MeanRevertExpert(BaseExpert):
     name = "MEAN_REVERT"
-
     def evaluate(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
-        candles: List[Dict[str, Any]] = trade_features.get("candles") or trade_features.get("window") or []
+        candles: List[Dict[str, Any]] = trade_features.get("candles") or []
         if len(candles) < 60:
-            return ExpertDecision(False, 0.0, self.name, {"reason": "not_enough_data"})
+            return ExpertDecision(False, 0.0, self.name, {"reason": "not_enough_data", "n": len(candles)})
 
         closes = [float(x.get("c", x.get("close"))) for x in candles[-60:]]
         mean = sum(closes) / 60.0
@@ -50,45 +45,30 @@ class MeanRevertExpert(BaseExpert):
         base = 0.65 if context.get("regime") == "range" else 0.40
         score = min(1.0, base + (dist / 10.0))
         allow = score >= 0.7
-
-        return ExpertDecision(
-            allow=allow,
-            score=score,
-            expert=self.name,
-            meta={"mean": mean, "last": last, "dist": dist, "regime": context.get("regime")},
-        )
+        return ExpertDecision(allow=allow, score=score, expert=self.name,
+                              meta={"mean": mean, "last": last, "dist": dist, "regime": context.get("regime")})
 
 
 class BreakoutExpert(BaseExpert):
     name = "BREAKOUT"
-
     def evaluate(self, trade_features: Dict[str, Any], context: Dict[str, Any]) -> ExpertDecision:
-        candles: List[Dict[str, Any]] = trade_features.get("candles") or trade_features.get("window") or []
+        candles: List[Dict[str, Any]] = trade_features.get("candles") or []
         if len(candles) < 40:
-            return ExpertDecision(False, 0.0, self.name, {"reason": "not_enough_data"})
+            return ExpertDecision(False, 0.0, self.name, {"reason": "not_enough_data", "n": len(candles)})
 
         closes = [float(x.get("c", x.get("close"))) for x in candles[-40:]]
-        hi = max(closes[:-1])
-        lo = min(closes[:-1])
-        last = closes[-1]
+        hi, lo, last = max(closes[:-1]), min(closes[:-1]), closes[-1]
+        broke = (last > hi) or (last < lo)
 
-        broke_up = last > hi
-        broke_dn = last < lo
-
-        score = 0.2
-        if broke_up or broke_dn:
-            score = 0.75
-            if context.get("regime") == "breakout":
-                score += 0.15
+        score = 0.75 if broke else 0.2
+        if context.get("regime") == "breakout":
+            score += 0.15
 
         allow = score >= 0.8
-        return ExpertDecision(
-            allow=allow,
-            score=min(score, 1.0),
-            expert=self.name,
-            meta={"hi": hi, "lo": lo, "last": last, "regime": context.get("regime")},
-        )
-
+        return ExpertDecision(allow=allow, score=min(score, 1.0), expert=self.name,
+                              meta={"hi": hi, "lo": lo, "last": last, "regime": context.get("regime")})
+# ✅ để DecisionEngine/ExpertRegistry có thể “register default” rất tiện
+DEFAULT_EXPERTS = [TrendMAExpert(), MeanRevertExpert(), BreakoutExpert()]
 
 def register_basic_experts(registry: Any) -> None:
     """

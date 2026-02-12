@@ -76,7 +76,7 @@ class ExpertGate:
           - internal dict-like
         """
         r = self.registry
-
+        
         if r is None:
             return []
 
@@ -156,6 +156,8 @@ class ExpertGate:
 
         decisions.sort(key=lambda d: d.score, reverse=True)
         best = decisions[0]
+        experts = list(self.registry.get_all()) if hasattr(self.registry, "get_all") else list(self.registry)
+        print("DEBUG REGISTRY EXPERTS:", [getattr(e, "name", type(e).__name__) for e in experts])
 
         # exploration: pick a different expert when exploring
         if self._should_explore() and len(decisions) > 1:
