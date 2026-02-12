@@ -165,16 +165,28 @@ def main():
         except TypeError:
             runner = ShadowRunner(de, risk_mgr=risk_engine, **runner_kwargs)
 
-    stats = runner.run(
-        candles=candles,
-        lookback=args.lookback,
-        max_steps=args.max_steps,
+    run_kwargs = dict(
+        journal=journal,
         horizon=args.horizon,
         train=args.train,
-        epsilon=args.epsilon,
-        epsilon_cooldown=args.epsilon_cooldown,
-        journal=journal,
+        max_steps=args.max_steps,
+        lookback=args.lookback,
     )
+
+    # Some ShadowRunner.run versions don't accept `candles=` kw; use compat fallbacks
+    try:
+        stats = runner.run(candles=candles, **run_kwargs)
+    except TypeError:
+        try:
+            # most common: first positional arg is candles/data
+            stats = runner.run(candles, **run_kwargs)
+        except TypeError:
+            try:
+                # alternative kw names
+                stats = runner.run(data=candles, **run_kwargs)
+            except TypeError:
+                stats = runner.run(rows=candles, **run_kwargs)
+
 
     stats_dict = _stats_to_dict(stats)
 
