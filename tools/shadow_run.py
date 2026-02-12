@@ -2,268 +2,186 @@
 from __future__ import annotations
 
 import argparse
-import random
+import inspect
 from typing import Any, Dict, Optional
 
-from sim.candle_loader import load_candles_csv
+from brain.decision_engine import DecisionEngine
+from brain.weight_store import WeightStore
+from observer.eval_reporter import EvalReporter
+from observer.outcome_updater import OutcomeUpdater
 from sim.shadow_runner import ShadowRunner
 
-from brain.decision_engine import DecisionEngine
-from brain.journal import Journal
-from brain.trade_memory import TradeMemory
-from brain.reinforcement_learner import ReinforcementLearner
-from brain.weight_store import WeightStore
-
-from observer.outcome_updater import OutcomeUpdater
-import inspect
-# Optional: evaluation reporter (5.1.1)
+# Optional imports (best effort)
 try:
-    from observer.eval_reporter import EvalReporter
-except Exception:  # pragma: no cover
-    EvalReporter = None  # type: ignore
+    from brain.trade_memory import TradeMemory
+except Exception:
+    TradeMemory = None  # type: ignore
 
 
-def _import_risk_engine():
-    # Project structure moved a few times; support both.
+def _filter_kwargs_for_callable(fn: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Return kwargs restricted to accepted parameters of fn (unless fn has **kwargs)."""
     try:
-        from risk.risk_engine import RiskEngine  # type: ignore
-
-        return RiskEngine
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return dict(kwargs)
+        allowed = set(params.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
     except Exception:
-        try:
-            from brain.risk_engine import RiskEngine  # type: ignore
-
-            return RiskEngine
-        except Exception:
-            from risk_engine import RiskEngine  # type: ignore
-
-            return RiskEngine
+        return dict(kwargs)
 
 
-def _stats_to_dict(stats: Any) -> Dict[str, Any]:
-    if stats is None:
-        return {}
-    if isinstance(stats, dict):
-        return stats
-    if hasattr(stats, "to_dict") and callable(getattr(stats, "to_dict")):
-        try:
-            return dict(stats.to_dict())
-        except Exception:
-            pass
+def _call_shadowrunner_run_compat(runner: Any, candles: Any, run_kwargs: Dict[str, Any]) -> Any:
+    """
+    Compat wrapper for ShadowRunner.run across versions:
 
-    d: Dict[str, Any] = {}
-    for k in [
-        "steps",
-        "decisions",
-        "allow",
-        "deny",
-        "errors",
-        "outcomes",
-        "wins",
-        "losses",
-        "total_pnl",
-        "forced_entries",
-    ]:
-        if hasattr(stats, k):
-            d[k] = getattr(stats, k)
-    return d
+    vA: run(self, candles, lookback=..., max_steps=..., journal=..., train=..., ...)
+    vB (5.1.8): run(self, max_steps=..., journal=..., train=...)  # candles come from runner/broker internally
+    """
+    run_fn = getattr(runner, "run", None)
+    if run_fn is None:
+        raise RuntimeError("ShadowRunner has no run()")
 
-
-def _weight_pair_count(ws: Optional[WeightStore]) -> int:
-    if ws is None:
-        return 0
     try:
-        d = ws.to_dict()
-        return sum(len(sub) for sub in d.values())
-    except Exception:
-        try:
-            return len(ws)  # type: ignore
-        except Exception:
-            return 0
+        sig = inspect.signature(run_fn)
+        params = list(sig.parameters.values())
+        # remove 'self'
+        if params and params[0].name == "self":
+            params = params[1:]
+        names = [p.name for p in params]
+
+        # If run accepts candles/rows/data -> old style
+        if any(n in ("candles", "rows", "data") for n in names):
+            filtered = _filter_kwargs_for_callable(run_fn, run_kwargs)
+
+            # Prefer keyword if supported
+            if "candles" in names:
+                return run_fn(candles=candles, **filtered)
+            if "rows" in names:
+                return run_fn(rows=candles, **filtered)
+            if "data" in names:
+                return run_fn(data=candles, **filtered)
+
+            # Fallback positional first arg (candles) ONLY if first param is not max_steps
+            # to avoid "candles list -> max_steps"
+            if names and names[0] not in ("max_steps", "steps"):
+                return run_fn(candles, **filtered)
+
+        # Otherwise new style (5.1.8): no candles param
+        filtered = _filter_kwargs_for_callable(run_fn, run_kwargs)
+        return run_fn(**filtered)
+
+    except TypeError:
+        # Last-resort attempts (do NOT pass candles as positional, it can break max_steps)
+        filtered = _filter_kwargs_for_callable(run_fn, run_kwargs)
+        return run_fn(**filtered)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True)
-    ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--lookback", type=int, default=300)
-    ap.add_argument("--max-steps", type=int, default=2000)
-    ap.add_argument("--train", action="store_true")
-    ap.add_argument("--horizon", type=int, default=30)
+def build_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--csv", required=True)
+    p.add_argument("--limit", type=int, default=5000)
+    p.add_argument("--lookback", type=int, default=300)
+    p.add_argument("--max-steps", type=int, default=2000)
+    p.add_argument("--horizon", type=int, default=30)
+    p.add_argument("--train", action="store_true")
+    p.add_argument("--epsilon", type=float, default=0.05)
+    p.add_argument("--epsilon-cooldown", type=int, default=50)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--journal", default="data/journal_train.jsonl")
+    p.add_argument("--weights", default="data/weights.json")
+    p.add_argument("--reports", default="data/reports")
+    return p.parse_args()
 
-    # exploration (owned by ShadowRunner)
-    ap.add_argument("--epsilon", type=float, default=0.0)
-    ap.add_argument("--epsilon-cooldown", type=int, default=0)
 
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--journal", type=str, default=None, help="path to journal jsonl (append)")
+def main() -> None:
+    args = build_args()
 
-    # weights (5.0.8.x)
-    ap.add_argument("--weights", type=str, default=None, help="path to weights json (load+save)")
+    # --- weight store ---
+    weight_store = WeightStore(path=args.weights)
 
-    # reporting (5.1.1)
-    ap.add_argument("--report-dir", type=str, default="data/reports")
-
-    args = ap.parse_args()
-
-    random.seed(args.seed)
-
-    candles = load_candles_csv(args.csv, limit=args.limit)
-    journal = Journal(args.journal) if args.journal else None
-
-    # Weight store
-    weight_store: Optional[WeightStore] = None
-    if args.weights:
-        # init with path => auto-load if file exists
-        weight_store = WeightStore(path=args.weights)
-
-    # Reporter (optional)
-    reporter = None
-    if EvalReporter is not None and args.report_dir:
-        try:
-            reporter = EvalReporter(out_dir=args.report_dir)
-            if weight_store is not None and hasattr(reporter, "snapshot_weights_before"):
-                reporter.snapshot_weights_before(weight_store)
-        except Exception:
-            reporter = None
-
-    trade_memory = TradeMemory() if args.train else None
-
-    learner = None
-    outcome_updater = None
-    if args.train:
-        learner = ReinforcementLearner(weight_store=weight_store)
-        outcome_updater = OutcomeUpdater(
-            learner=learner,
-            trade_memory=trade_memory,
-            weight_store=weight_store,
-            weights_path=args.weights,
-            autosave=True,
-        )
-
-    RiskEngine = _import_risk_engine()
-    risk_engine = RiskEngine()
-
+    # --- decision engine ---
+    # NOTE: your DecisionEngine signature may require risk_engine; keep explicit
+    # If your DecisionEngine needs other deps, add them here (do not delete existing)
     de = DecisionEngine(
-        risk_engine=risk_engine,
+        risk_engine=None,           # keep compat; your engine may ignore
         weight_store=weight_store,
     )
 
-    runner_kwargs = dict(
+    # --- optional trade memory ---
+    trade_memory = None
+    if TradeMemory is not None:
+        try:
+            trade_memory = TradeMemory()
+        except Exception:
+            trade_memory = None
+
+    # --- outcome updater (best-effort compat) ---
+    outcome_updater = OutcomeUpdater(
+        learner=None,
+        trade_memory=trade_memory,
         weight_store=weight_store,
+        meta_controller=getattr(de, "meta_controller", None),
+        weights_path=args.weights,
+        autosave=True,
+    )
+
+    # --- eval reporter ---
+    reporter = EvalReporter(out_dir=args.reports)
+
+    # --- ShadowRunner init (compat by filtering kwargs) ---
+    # ShadowRunner in 5.1.8 usually loads candles from broker internally.
+    runner_init_kwargs = dict(
+        decision_engine=de,
+        csv=args.csv,
+        limit=args.limit,
+        lookback=args.lookback,
+        horizon=args.horizon,
         outcome_updater=outcome_updater,
         reporter=reporter,
-        train=args.train,
+        seed=args.seed,
+        epsilon=args.epsilon,
+        epsilon_cooldown=args.epsilon_cooldown,
     )
+    init_fn = ShadowRunner.__init__
+    runner_init_kwargs = _filter_kwargs_for_callable(init_fn, runner_init_kwargs)
 
-    # Try newer kw name first, fallback to older ones
-    try:
-        runner = ShadowRunner(de, risk_engine=risk_engine, **runner_kwargs)
-    except TypeError:
-        try:
-            runner = ShadowRunner(de, risk=risk_engine, **runner_kwargs)
-        except TypeError:
-            runner = ShadowRunner(de, risk_mgr=risk_engine, **runner_kwargs)
+    runner = ShadowRunner(**runner_init_kwargs)
 
+    # --- run compat ---
     run_kwargs = dict(
-        journal=journal,
-        horizon=args.horizon,
-        train=args.train,
         max_steps=args.max_steps,
-        lookback=args.lookback,
+        journal=args.journal,
+        train=args.train,
     )
 
-    # Some ShadowRunner.run versions don't accept `candles=` kw; use compat fallbacks
-    def _call_shadowrunner_run_compat(runner, candles, run_kwargs: dict):
-        """
-        Compat layer for ShadowRunner.run across versions:
-        - Some versions accept kwargs: candles=..., journal=..., horizon=...
-        - Some versions accept only positional args and reject ALL kwargs.
-        - Some versions use different input param name (candles/data/rows).
-        """
-        try:
-            sig = inspect.signature(runner.run)
-            params = list(sig.parameters.values())
-            param_names = [p.name for p in params]
-
-            # remove 'self' if present
-            if param_names and param_names[0] == "self":
-                param_names = param_names[1:]
-
-            # Build filtered kwargs that run() actually accepts
-            filtered = {}
-            for k, v in (run_kwargs or {}).items():
-                if k in param_names:
-                    filtered[k] = v
-
-            # Decide how to pass candles
-            # If run() has a named input param, pass by that name; otherwise pass as 1st positional
-            input_name = None
-            for cand_name in ("candles", "data", "rows", "series", "df", "bars", "prices"):
-                if cand_name in param_names:
-                    input_name = cand_name
-                    break
-
-            if input_name is not None:
-                # pass candles as kw + filtered other kwargs
-                return runner.run(**{input_name: candles, **filtered})
-
-            # else: positional candles first, plus ONLY kwargs supported
-            # if run() supports no kwargs => filtered will be empty
-            return runner.run(candles, **filtered)
-
-        except Exception:
-            # absolute fallback: positional only, no kwargs
-            return runner.run(candles)
-
-
-    # ---- later in main() where you run ----
-    run_kwargs = dict(
-        journal=journal,
-        horizon=args.horizon,
-        train=args.train,
-        max_steps=args.max_steps,
-        lookback=args.lookback,
-    )
-
+    # Some older versions require candles from loader; 5.1.8 doesn't.
+    candles = None
     stats = _call_shadowrunner_run_compat(runner, candles, run_kwargs)
 
+    # --- summary print ---
+    try:
+        ws = weight_store.to_dict() if hasattr(weight_store, "to_dict") else {}
+        print("\n=== SHADOW RUN DONE ===")
+        print("WEIGHT SIZE:", len(ws) if isinstance(ws, dict) else 0)
+    except Exception:
+        print("\n=== SHADOW RUN DONE ===")
 
+    # stats can be dict or dataclass-like
+    if isinstance(stats, dict):
+        for k in ["steps", "decisions", "allow", "deny", "errors", "outcomes", "wins", "losses", "total_pnl", "forced_entries", "regime_breakdown"]:
+            if k in stats:
+                print(f"{k}: {stats[k]}")
+    else:
+        # best-effort attributes
+        for k in ["steps", "decisions", "allow", "deny", "errors", "outcomes", "wins", "losses", "total_pnl", "forced_entries", "regime_breakdown"]:
+            if hasattr(stats, k):
+                print(f"{k}: {getattr(stats, k)}")
 
-    stats_dict = _stats_to_dict(stats)
-
-    # Reporter finalize
-    if reporter is not None:
-        try:
-            if weight_store is not None and hasattr(reporter, "snapshot_weights_after"):
-                reporter.snapshot_weights_after(weight_store)
-
-            if hasattr(reporter, "write") and callable(getattr(reporter, "write")):
-                reporter.write(
-                    stats=stats_dict,
-                    extra={
-                        "csv": args.csv,
-                        "limit": args.limit,
-                        "lookback": args.lookback,
-                        "max_steps": args.max_steps,
-                        "horizon": args.horizon,
-                        "train": args.train,
-                        "epsilon": args.epsilon,
-                        "epsilon_cooldown": args.epsilon_cooldown,
-                        "seed": args.seed,
-                        "journal": args.journal,
-                        "weights": args.weights,
-                    },
-                )
-            elif hasattr(reporter, "finalize") and callable(getattr(reporter, "finalize")):
-                reporter.finalize(stats=stats_dict)
-        except Exception as e:
-            print(f"[shadow_run] WARN: reporter finalize failed: {e}")
-
-    print("=== SHADOW RUN DONE ===")
-    print("WEIGHT SIZE:", _weight_pair_count(weight_store))
-    for k, v in stats_dict.items():
-        print(f"{k}: {v}")
+    try:
+        reporter.finalize(stats)
+    except Exception as e:
+        print("[shadow_run] WARN: reporter finalize failed:", repr(e))
 
 
 if __name__ == "__main__":

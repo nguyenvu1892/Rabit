@@ -1,90 +1,157 @@
-# brain/experts/expert_base.py
+# brain/experts/expert_gate.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+# NOTE:
+# - ExpertDecision SHOULD be defined in expert_base.py (single source of truth)
+# - We re-export it here for backward compatibility.
+from brain.experts.expert_base import ExpertBase, ExpertDecision, coerce_decision
 
 
-@dataclass
-class ExpertDecision:
-    """
-    Unified decision object used across engine/gate.
-
-    Backward-compat:
-    - some older code may return dicts or objects with similar fields
-    - coerce_decision() will normalize.
-    """
-    expert: str
-    score: float = 0.0
-    allow: bool = False
-    action: str = "hold"  # 'buy'/'sell'/'hold'
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-
-def safe_float(x: Any, default: float = 0.0) -> float:
+def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
-        v = float(x)
-        if v != v:  # NaN
-            return float(default)
-        return v
+        if x is None:
+            return default
+        return float(x)
     except Exception:
-        return float(default)
+        return default
 
 
-def coerce_decision(raw: Any, fallback_expert: str = "UNKNOWN") -> Optional[ExpertDecision]:
+class ExpertGate:
     """
-    Normalize various decision formats into ExpertDecision.
+    ExpertGate selects a decision from experts registry.
 
-    Supports:
-    - ExpertDecision
-    - dict-like: {expert, score, allow, action, meta}
-    - object-like with attributes.
+    Contract:
+      pick(features, context) -> (best_decision: Optional[ExpertDecision], all_decisions: List[ExpertDecision])
+
+    Behavior:
+      - Collect decisions from experts
+      - Adjust score by weight_store(expert, regime) if available
+      - Choose best by score (desc)
+      - If all experts deny, inject FALLBACK allow=True (hold) to avoid deny=100%
     """
-    if raw is None:
-        return None
 
-    if isinstance(raw, ExpertDecision):
-        raw.meta = dict(raw.meta or {})
-        return raw
+    def __init__(
+        self,
+        registry: Any,
+        weight_store: Optional[Any] = None,
+        regime_detector: Optional[Any] = None,
+        debug: bool = False,
+    ) -> None:
+        self.registry = registry
+        self.weight_store = weight_store
+        self.regime_detector = regime_detector
+        self.debug = bool(debug)
 
-    if isinstance(raw, dict):
-        expert = str(raw.get("expert") or fallback_expert)
-        score = safe_float(raw.get("score"), 0.0)
-        allow = bool(raw.get("allow", False))
-        action = str(raw.get("action") or "hold")
-        meta = dict(raw.get("meta") or {})
-        return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=meta)
+    def _get_regime(self, features: Dict[str, Any], context: Optional[Dict[str, Any]]) -> str:
+        # regime can come from context first
+        if context and context.get("regime") is not None:
+            return str(context["regime"])
 
-    expert = str(getattr(raw, "expert", None) or fallback_expert)
-    score = safe_float(getattr(raw, "score", 0.0), 0.0)
-    allow = bool(getattr(raw, "allow", False))
-    action = str(getattr(raw, "action", None) or "hold")
-    meta = dict(getattr(raw, "meta", None) or {})
+        # try regime_detector
+        try:
+            if self.regime_detector is not None and hasattr(self.regime_detector, "detect"):
+                rr = self.regime_detector.detect(features, context or {})
+                # rr may be object; stringify for stable keys
+                if rr is None:
+                    return "unknown"
+                # if it has .regime use it
+                if hasattr(rr, "regime"):
+                    return str(getattr(rr, "regime"))
+                return str(rr)
+        except Exception:
+            pass
 
-    return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=meta)
+        return "unknown"
 
+    def pick(
+        self,
+        features: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[ExpertDecision], List[ExpertDecision]]:
+        context = context or {}
+        regime = self._get_regime(features, context)
 
-class BaseExpert:
-    """
-    Base class for experts.
-    - decide(features, context) -> ExpertDecision|dict|None
-    """
-    name: str = "BASE"
+        experts: List[Any] = []
+        try:
+            if self.registry is not None and hasattr(self.registry, "get_all"):
+                experts = list(self.registry.get_all())
+        except Exception:
+            experts = []
 
-    def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Any:
-        raise NotImplementedError
+        decisions: List[ExpertDecision] = []
 
+        for exp in experts:
+            try:
+                # exp can be ExpertBase or any compatible object
+                name = getattr(exp, "name", None) or getattr(exp, "expert_name", None) or exp.__class__.__name__
+                name = str(name)
 
-# -------------------------
-# Backward compatibility
-# -------------------------
-# Old code expects "ExpertBase"
-ExpertBase = BaseExpert
+                raw = exp.decide(features, context)  # can return ExpertDecision / dict / tuple / None
+                dec = coerce_decision(raw, fallback_expert=name)
+                if dec is None:
+                    continue
 
-__all__ = [
-    "ExpertDecision",
-    "safe_float",
-    "coerce_decision",
-    "BaseExpert",
-    "ExpertBase",
-]
+                # ensure expert name is consistent
+                dec.expert = str(getattr(dec, "expert", None) or name)
+
+                # base score
+                s = _safe_float(getattr(dec, "score", 0.0), 0.0)
+
+                # weight by store
+                w = 1.0
+                if self.weight_store is not None and hasattr(self.weight_store, "get"):
+                    try:
+                        w = _safe_float(self.weight_store.get(dec.expert, regime), 1.0)
+                    except Exception:
+                        w = 1.0
+
+                adj = s * w
+                dec.score = adj
+
+                # meta enrich
+                meta = dict(getattr(dec, "meta", None) or {})
+                meta.setdefault("raw_score", s)
+                meta.setdefault("w", w)
+                meta.setdefault("regime", regime)
+                dec.meta = meta
+
+                decisions.append(dec)
+
+            except Exception:
+                continue
+
+        if not decisions:
+            # no expert produced a decision -> do NOT force deny loop; return None for engine to decide
+            return None, []
+
+        # sort by score desc
+        decisions.sort(key=lambda d: _safe_float(getattr(d, "score", 0.0), 0.0), reverse=True)
+        best = decisions[0]
+
+        # If every expert denies, inject a safe fallback allow=True
+        if not any(bool(getattr(d, "allow", False)) for d in decisions):
+            try:
+                fb = ExpertDecision(
+                    expert="FALLBACK",
+                    score=0.01,          # tiny positive score
+                    allow=True,
+                    action="hold",
+                    meta={"reason": "all_experts_denied", "regime": regime},
+                )
+                decisions.append(fb)
+                best = fb
+            except Exception:
+                # if dataclass fails for any reason, keep best as-is
+                pass
+
+        if self.debug:
+            try:
+                print("DEBUG REGISTRY EXPERTS:", [getattr(e, "name", e.__class__.__name__) for e in experts])
+                print("DEBUG BEST:", best)
+            except Exception:
+                pass
+
+        return best, decisions

@@ -7,7 +7,8 @@ from typing import Any, Dict, Optional, Tuple
 from brain.regime_detector import RegimeDetector
 from brain.meta_controller import MetaController
 from brain.experts.expert_registry import ExpertRegistry
-from brain.experts.expert_gate import ExpertGate, ExpertDecision
+from brain.experts.expert_gate import ExpertGate
+from brain.experts.expert_base import ExpertDecision
 
 @dataclass
 class DecisionContext:
@@ -45,11 +46,11 @@ class DecisionEngine:
 
     def __init__(
         self,
-        risk_engine: Any = None,
-        weight_store: Any = None,
+        risk_engine: Any,
+        weight_store: Optional[WeightStore] = None,
         regime_detector: Optional[RegimeDetector] = None,
         meta_controller: Optional[MetaController] = None,
-        **kwargs,
+        gate: Optional[ExpertGate] = None,
     ) -> None:
         self.risk_engine = risk_engine
         self.weight_store = weight_store
@@ -97,57 +98,97 @@ class DecisionEngine:
             return str(r or "unknown")
         except Exception:
             return "unknown"
+    
+    def _extract_candles(self, trade_features: Any) -> Optional[list]:
+        """
+        Robustly extract candles list from trade_features.
+        Supports:
+        - dict with keys: candles/window/recent/bars
+        - already-a-list
+        """
+        if trade_features is None:
+            return None
+        if isinstance(trade_features, list):
+            return trade_features
+        if isinstance(trade_features, dict):
+            for k in ("candles", "window", "recent", "bars"):
+                v = trade_features.get(k)
+                if isinstance(v, list):
+                    return v
+        return None
 
-    def evaluate_trade(self, trade_features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Tuple[bool, float, Dict[str, Any]]:
-        ctx: Dict[str, Any] = dict(context or {})
+    def evaluate_trade(self, trade_features: Dict[str, Any]) -> Tuple[bool, float, Dict[str, Any]]:
+            """
+            Returns: (allow, score, risk_cfg)
+            """
 
-        # 1) detect regime
-        regime = "unknown"
-        try:
-            if hasattr(self.regime_detector, "detect"):
-                regime = self.regime_detector.detect(trade_features)
-            elif hasattr(self.regime_detector, "classify"):
-                regime = self.regime_detector.classify(trade_features)
-        except Exception:
-            regime = "unknown"
+            # ---- 1) Detect regime correctly (must be candles list) ----
+            candles = self._extract_candles(trade_features)
+            regime_result: RegimeResult = self.regime_detector.detect(candles or [])
 
-        ctx["regime"] = str(regime or "unknown")
+            # IMPORTANT: keep BOTH
+            # - context["regime"] as a simple string: "trend"/"range"/"breakout"/"unknown"
+            # - context["regime_result"] as the object (vol/slope/confidence)
+            context: Dict[str, Any] = {
+                "regime": str(regime_result.regime),
+                "regime_result": regime_result,
+                "regime_conf": float(getattr(regime_result, "confidence", 0.0) or 0.0),
+            }
 
-        # 2) meta policy (threshold, epsilon)
-        meta_policy = {}
-        try:
-            meta_policy = self.meta_controller.get_policy(ctx["regime"])
-        except Exception:
-            meta_policy = {"score_threshold": 0.0, "epsilon": 0.05}
+            # ---- 2) Meta controller can adjust thresholds / params by regime ----
+            # Keep this non-breaking: if meta_controller doesn't implement some method, skip gracefully.
+            try:
+                self.meta_controller.apply(context=context, features=trade_features)
+            except Exception:
+                pass
 
-        ctx["meta_policy"] = meta_policy
+            # ---- 3) Experts pick ----
+            best_dec, all_decisions = self.gate.pick(trade_features, context)
 
-        # 3) pick via gate
-        best, all_decisions = self.gate.pick(trade_features, ctx)
+            # Normalize allow/score even if best_dec is None or has different fields
+            allow = False
+            score = 0.0
+            action = "hold"
+            meta = {}
 
-        # normalize
-        best_score = 0.0
-        best_expert = None
-        best_allow = False
-        if best is not None:
-            best_score = float(getattr(best, "score", 0.0) or 0.0)
-            best_expert = str(getattr(best, "expert", "unknown") or "unknown")
-            best_allow = bool(getattr(best, "allow", False))
+            if best_dec is not None:
+                # allow
+                if hasattr(best_dec, "allow"):
+                    allow = bool(getattr(best_dec, "allow"))
+                elif hasattr(best_dec, "allowed"):
+                    allow = bool(getattr(best_dec, "allowed"))
+                else:
+                    # fallback (truthy default)
+                    allow = bool(getattr(best_dec, "ok", False))
 
-        # 4) call meta_controller with decision (confidence = best_score clipped)
-        try:
-            conf = max(0.0, min(1.0, float(best_score)))
-            self.meta_controller.on_decision(ctx["regime"], best_allow, conf)
-        except Exception:
-            pass
+                # score
+                try:
+                    score = float(getattr(best_dec, "score", 0.0) or 0.0)
+                except Exception:
+                    score = 0.0
 
-        # 5) risk cfg (used by outcome_updater + weight_store updates)
-        risk_cfg = {
-            "expert": best_expert,
-            "regime": ctx["regime"],
-            "score": best_score,
-            "score_threshold": float(meta_policy.get("score_threshold", 0.0)),
-            "epsilon": float(meta_policy.get("epsilon", 0.0)),
-        }
+                # action
+                action = str(getattr(best_dec, "action", "hold") or "hold")
 
-        return best_allow, best_score, risk_cfg
+                # meta
+                m = getattr(best_dec, "meta", {}) or {}
+                meta = m if isinstance(m, dict) else {"meta": m}
+
+            # ---- 4) Risk engine (optional) ----
+            risk_cfg: Dict[str, Any] = {
+                "regime": context["regime"],
+                "regime_conf": context.get("regime_conf", 0.0),
+                "action": action,
+                "best_meta": meta,
+                "all_decisions": [d.to_dict() if hasattr(d, "to_dict") else (d.__dict__ if hasattr(d, "__dict__") else str(d)) for d in (all_decisions or [])],
+            }
+
+            try:
+                # Let risk_engine override/append
+                extra = self.risk_engine.compute(trade_features, context=context, decision=best_dec)
+                if isinstance(extra, dict):
+                    risk_cfg.update(extra)
+            except Exception:
+                pass
+
+            return allow, score, risk_cfg

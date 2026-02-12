@@ -25,18 +25,33 @@ class ShadowRunner:
     """
 
     def __init__(
-        self,
-        decision_engine: Any,
-        broker: Any,
-        lookback: int = 300,
-        horizon: int = 30,
-        logger: Optional[Any] = None,
-    ) -> None:
-        self.de = decision_engine
-        self.broker = broker
-        self.lookback = int(lookback)
-        self.horizon = int(horizon)
-        self.logger = logger
+            self,
+            de,
+            risk_engine=None,
+            risk=None,
+            risk_mgr=None,
+            weight_store=None,
+            outcome_updater=None,
+            reporter=None,
+            train: bool = False,
+            **kwargs,
+        ):
+        self.de = de
+
+        # --- compat mapping for risk component ---
+        self.risk_engine = risk_engine or risk or risk_mgr
+
+        # keep old attribute names if they exist elsewhere in code
+        self.risk = self.risk_engine
+        self.risk_mgr = self.risk_engine
+
+        self.weight_store = weight_store
+        self.outcome_updater = outcome_updater
+        self.reporter = reporter
+        self.train = bool(train)
+
+        # keep any extra fields for future extension
+        self.kwargs = dict(kwargs or {})
 
     def _build_trade_features(self) -> Dict[str, Any]:
         # IMPORTANT: provide candles in keys that meta/regime can read

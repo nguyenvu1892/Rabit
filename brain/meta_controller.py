@@ -1,195 +1,231 @@
 # brain/meta_controller.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
+from brain.regime_detector import RegimeDetector, RegimeResult
+from brain.weight_store import WeightStore
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
+try:
+    from brain.experts.expert_base import ExpertDecision  # only for typing/compat
+except Exception:
+    ExpertDecision = Any  # type: ignore
 
 
 @dataclass
-class RegimeMetaState:
-    # EMA of confidence (score) and outcome
-    ema_conf: float = 0.0
-    ema_reward: float = 0.0  # +1/-1-ish reward
-    ema_winrate: float = 0.5
-
-    # Counts
-    n: int = 0
-    n_allow: int = 0
-    n_deny: int = 0
-
-    # Adaptive threshold (what we want to learn)
-    score_threshold: float = 0.05  # default tiny > 0
-
-    # Optional exploration by regime
-    epsilon: float = 0.05
-
-    def update_decision(self, allow: bool, conf: float, alpha: float = 0.05) -> None:
-        self.n += 1
-        if allow:
-            self.n_allow += 1
-        else:
-            self.n_deny += 1
-
-        conf = max(0.0, min(1.0, _safe_float(conf, 0.0)))
-        self.ema_conf = (1 - alpha) * self.ema_conf + alpha * conf
-
-    def update_outcome(self, reward: float, alpha: float = 0.05) -> None:
-        # reward expected in [-1, +1]
-        r = max(-1.0, min(1.0, _safe_float(reward, 0.0)))
-        self.ema_reward = (1 - alpha) * self.ema_reward + alpha * r
-
-        win = 1.0 if r > 0 else 0.0 if r < 0 else 0.5
-        self.ema_winrate = (1 - alpha) * self.ema_winrate + alpha * win
+class MetaDecision:
+    allow: bool
+    score: float
+    reasons: List[str]
+    regime: str
+    primary_expert: str
+    confirm_experts: List[str]
+    veto_expert: Optional[str]
+    side: str
+    risk_cfg: Dict[str, Any]
 
 
 class MetaController:
     """
-    5.1.8 Meta Intelligence:
-    - Track decision confidence by regime
-    - Track outcome reward by regime
-    - Adapt per-regime score_threshold (gating)
-    - Optionally adapt epsilon by regime
+    Meta layer (MoE gating).
 
-    IMPORTANT:
-    - Keep backward compatibility: all methods are best-effort and safe.
+    IMPORTANT (per your requirement):
+    - meta must NOT be able to hard-block whole engine just because missing candles / missing expert
+    - default mode is fail-open (allow=True) when inputs insufficient
     """
 
     def __init__(
         self,
-        base_threshold: float = 0.05,
-        min_threshold: float = 0.0,
-        max_threshold: float = 1.0,
-        base_epsilon: float = 0.05,
-        alpha: float = 0.05,
-        **kwargs,
+        regime_detector: Optional[RegimeDetector] = None,
+        experts: Optional[Dict[str, Any]] = None,
+        store: Optional[WeightStore] = None,
+        allow_threshold: float = 0.55,
+        enabled: bool = True,
+        fail_open: bool = True,
     ) -> None:
-        self.base_threshold = float(base_threshold)
-        self.min_threshold = float(min_threshold)
-        self.max_threshold = float(max_threshold)
-        self.base_epsilon = float(base_epsilon)
-        self.alpha = float(alpha)
+        self.enabled = bool(enabled)
+        self.fail_open = bool(fail_open)
+        self.detector = regime_detector or RegimeDetector()
+        self.experts = experts or {}
+        self.store = store or WeightStore()
+        self.allow_threshold = float(allow_threshold)
 
-        self.by_regime: Dict[str, RegimeMetaState] = {}
-
-    def _state(self, regime: Optional[str]) -> RegimeMetaState:
-        r = str(regime or "unknown")
-        if r not in self.by_regime:
-            self.by_regime[r] = RegimeMetaState(
-                score_threshold=self.base_threshold,
-                epsilon=self.base_epsilon,
-            )
-        return self.by_regime[r]
-
-    # -----------------------
-    # Read policy
-    # -----------------------
-    def get_policy(self, regime: Optional[str]) -> Dict[str, float]:
-        st = self._state(regime)
-        return {
-            "score_threshold": float(st.score_threshold),
-            "epsilon": float(st.epsilon),
-            "ema_conf": float(st.ema_conf),
-            "ema_reward": float(st.ema_reward),
-            "ema_winrate": float(st.ema_winrate),
-            "n": int(st.n),
-            "n_allow": int(st.n_allow),
-            "n_deny": int(st.n_deny),
+        # regime -> (primary, confirms[], veto)
+        self.policy = {
+            "breakout": ("TREND_MA", ["SMC_PLACEHOLDER"], "RANGE_ZSCORE"),
+            "trend": ("TREND_MA", ["SMC_PLACEHOLDER"], "RANGE_ZSCORE"),
+            "range": ("RANGE_ZSCORE", ["SMC_PLACEHOLDER"], "TREND_MA"),
+            "unknown": ("TREND_MA", ["RANGE_ZSCORE"], None),
         }
 
-    def get_score_threshold(self, regime: Optional[str]) -> float:
-        return float(self._state(regime).score_threshold)
+    def _get_expert(self, name: str):
+        return self.experts.get(name)
 
-    def get_epsilon(self, regime: Optional[str]) -> float:
-        return float(self._state(regime).epsilon)
+    def _get_candles(self, trade_features: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # accept many keys across versions
+        return (
+            trade_features.get("candles_window")
+            or trade_features.get("candles")
+            or trade_features.get("window")
+            or trade_features.get("bars")
+            or []
+        )
 
-    # -----------------------
-    # Update from decision trace
-    # -----------------------
-    def on_decision(self, regime: Optional[str], allow: bool, confidence: float) -> None:
-        st = self._state(regime)
-        st.update_decision(bool(allow), _safe_float(confidence, 0.0), alpha=self.alpha)
+    def evaluate(self, trade_features: Dict[str, Any]) -> MetaDecision:
+        if not self.enabled:
+            return MetaDecision(
+                allow=True,
+                score=1.0,
+                reasons=["meta_disabled"],
+                regime="unknown",
+                primary_expert="",
+                confirm_experts=[],
+                veto_expert=None,
+                side="neutral",
+                risk_cfg={},
+            )
 
-        # Light shaping: if we deny too much but confidence EMA is healthy -> lower threshold
-        # if allow too much but reward EMA negative -> raise threshold
-        self._adapt_threshold(regime)
+        candles = self._get_candles(trade_features)
+        if not candles or len(candles) < 50:
+            # FAIL-OPEN: do not block engine when missing candles
+            if self.fail_open:
+                return MetaDecision(
+                    allow=True,
+                    score=1.0,
+                    reasons=["meta_no_candles_fail_open"],
+                    regime="unknown",
+                    primary_expert="",
+                    confirm_experts=[],
+                    veto_expert=None,
+                    side="neutral",
+                    risk_cfg={},
+                )
+            return MetaDecision(
+                allow=False,
+                score=0.0,
+                reasons=["meta_no_candles"],
+                regime="unknown",
+                primary_expert="",
+                confirm_experts=[],
+                veto_expert=None,
+                side="neutral",
+                risk_cfg={},
+            )
 
-    # -----------------------
-    # Update from realized outcome
-    # -----------------------
-    def on_outcome(self, regime: Optional[str], reward: float) -> None:
-        st = self._state(regime)
-        st.update_outcome(_safe_float(reward, 0.0), alpha=self.alpha)
+        reg: RegimeResult = self.detector.detect(candles)
+        primary_name, confirms, veto_name = self.policy.get(reg.regime, self.policy["unknown"])
 
-        self._adapt_threshold(regime)
-        self._adapt_epsilon(regime)
+        primary = self._get_expert(primary_name)
+        if primary is None:
+            # FAIL-OPEN
+            if self.fail_open:
+                return MetaDecision(
+                    allow=True,
+                    score=1.0,
+                    reasons=[f"missing_primary:{primary_name}", f"regime:{reg.regime}:{reg.confidence:.2f}", "fail_open"],
+                    regime=reg.regime,
+                    primary_expert=primary_name,
+                    confirm_experts=[],
+                    veto_expert=veto_name,
+                    side="neutral",
+                    risk_cfg={},
+                )
+            return MetaDecision(
+                allow=False,
+                score=0.0,
+                reasons=[f"missing_primary:{primary_name}", f"regime:{reg.regime}:{reg.confidence:.2f}"],
+                regime=reg.regime,
+                primary_expert=primary_name,
+                confirm_experts=[],
+                veto_expert=veto_name,
+                side="neutral",
+                risk_cfg={},
+            )
 
-    # -----------------------
-    # Internal adaptation rules (simple & stable)
-    # -----------------------
-    def _adapt_threshold(self, regime: Optional[str]) -> None:
-        st = self._state(regime)
+        # Duck-typed signal: expert may implement evaluate() or decide()
+        if hasattr(primary, "evaluate"):
+            sig = primary.evaluate(trade_features)
+            p_side = str(getattr(sig, "side", "neutral"))
+            p_conf = float(getattr(sig, "confidence", getattr(sig, "score", 0.0)) or 0.0)
+            p_reasons = list(getattr(sig, "reasons", []) or [])
+            p_risk = dict(getattr(sig, "risk_hint", {}) or {})
+        else:
+            # fallback to decide()
+            raw = primary.decide(trade_features, {"regime": reg.regime})
+            d = raw if isinstance(raw, dict) else getattr(raw, "__dict__", {})
+            p_side = str(d.get("side", "neutral"))
+            p_conf = float(d.get("confidence", d.get("score", 0.0)) or 0.0)
+            p_reasons = list(d.get("reasons", []) or [])
+            p_risk = dict(d.get("risk_hint", {}) or {})
 
-        # signal
-        conf = float(st.ema_conf)
-        rew = float(st.ema_reward)
-        wr = float(st.ema_winrate)
+        reasons = [f"regime:{reg.regime}:{reg.confidence:.2f}", f"primary:{primary_name}:{p_side}:{p_conf:.2f}"]
+        reasons += [f"p:{r}" for r in p_reasons]
 
-        # small step
-        step = 0.01
+        if p_side == "neutral" or p_conf <= 0.01:
+            # FAIL-OPEN: do not kill engine, just say meta is neutral
+            return MetaDecision(
+                allow=True if self.fail_open else False,
+                score=float(p_conf),
+                reasons=reasons + ["primary_neutral_fail_open" if self.fail_open else "primary_neutral"],
+                regime=reg.regime,
+                primary_expert=primary_name,
+                confirm_experts=[],
+                veto_expert=veto_name,
+                side="neutral",
+                risk_cfg={},
+            )
 
-        # If reward is negative, become stricter
-        if rew < -0.10:
-            st.score_threshold += step
-        # If reward positive and confidence decent, relax a bit
-        elif rew > 0.10 and conf > 0.05:
-            st.score_threshold -= step
-        # If deny ratio huge while confidence is not terrible => relax
-        if st.n >= 50:
-            deny_ratio = st.n_deny / max(1, st.n)
-            if deny_ratio > 0.85 and conf > 0.03:
-                st.score_threshold -= step
+        # confirm stage (optional)
+        confirm_score = 0.0
+        confirm_used: List[str] = []
+        for cn in confirms:
+            ex = self._get_expert(cn)
+            if ex is None or not hasattr(ex, "evaluate"):
+                continue
+            s = ex.evaluate(trade_features)
+            s_side = str(getattr(s, "side", "neutral"))
+            s_conf = float(getattr(s, "confidence", getattr(s, "score", 0.0)) or 0.0)
+            s_reasons = list(getattr(s, "reasons", []) or [])
+            confirm_used.append(cn)
+            reasons.append(f"confirm:{cn}:{s_side}:{s_conf:.2f}")
+            reasons += [f"c:{cn}:{r}" for r in s_reasons]
+            if s_side == "neutral":
+                continue
+            confirm_score += (0.25 * s_conf) if (s_side == p_side) else (-0.35 * s_conf)
 
-        # Clamp
-        st.score_threshold = max(self.min_threshold, min(self.max_threshold, st.score_threshold))
+        veto_hit = False
+        if veto_name:
+            vx = self._get_expert(veto_name)
+            if vx is not None and hasattr(vx, "evaluate"):
+                v = vx.evaluate(trade_features)
+                v_side = str(getattr(v, "side", "neutral"))
+                v_conf = float(getattr(v, "confidence", getattr(v, "score", 0.0)) or 0.0)
+                reasons.append(f"veto:{veto_name}:{v_side}:{v_conf:.2f}")
+                if v_side != "neutral" and v_side != p_side and v_conf > 0.35:
+                    veto_hit = True
+                    reasons.append("veto_hit")
 
-        # If winrate is extremely low, clamp higher floor a bit (avoid overtrading)
-        if st.n >= 50 and wr < 0.35:
-            st.score_threshold = max(st.score_threshold, 0.08)
+        base = float(p_conf) * (0.6 + 0.4 * float(reg.confidence))
+        score = max(0.0, min(1.0, base + confirm_score))
 
-    def _adapt_epsilon(self, regime: Optional[str]) -> None:
-        st = self._state(regime)
-        # If doing well -> explore less; if doing bad -> explore more (bounded)
-        wr = float(st.ema_winrate)
-        step = 0.01
+        allow = (score >= self.allow_threshold) and (not veto_hit)
+        if self.fail_open and (not allow):
+            # fail-open: meta can *recommend deny*, but does not hard block engine.
+            reasons.append("meta_recommend_deny_but_fail_open")
+            allow = True
 
-        if st.n < 50:
-            return
+        risk_cfg = dict(p_risk or {})
+        risk_cfg.setdefault("side", p_side)
 
-        if wr > 0.60:
-            st.epsilon = max(0.0, st.epsilon - step)
-        elif wr < 0.45:
-            st.epsilon = min(0.20, st.epsilon + step)
-
-    def snapshot(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        for r, st in self.by_regime.items():
-            out[r] = {
-                "ema_conf": st.ema_conf,
-                "ema_reward": st.ema_reward,
-                "ema_winrate": st.ema_winrate,
-                "n": st.n,
-                "n_allow": st.n_allow,
-                "n_deny": st.n_deny,
-                "score_threshold": st.score_threshold,
-                "epsilon": st.epsilon,
-            }
-        return out
+        return MetaDecision(
+            allow=bool(allow),
+            score=float(score),
+            reasons=reasons,
+            regime=reg.regime,
+            primary_expert=primary_name,
+            confirm_experts=confirm_used,
+            veto_expert=veto_name,
+            side=p_side if allow else "neutral",
+            risk_cfg=risk_cfg,
+        )
