@@ -110,4 +110,27 @@ class ExpertGate:
 
         # strict deny: pick best scoring deny (for debugging)
         best = max(decisions, key=lambda d: float(d.score or 0.0))
+        # Nếu không có decision nào allow => thêm fallback HOLD để tránh deny=100%
+        if decisions and not any(getattr(d, "allow", False) for d in decisions):
+            decisions.append(
+                ExpertDecision(
+                    expert="FALLBACK",
+                    score=0.0,
+                    allow=True,
+                    action="hold",
+                    meta={"reason": "all_experts_denied"},
+                )
+            )
+            best_dec = decisions[-1]
+
+        # Nếu decisions rỗng hoàn toàn => trả fallback luôn
+        if not decisions:
+            # emergency fallback decision
+            fallback = ExpertDecision(
+                expert="BASELINE_FALLBACK",
+                score=0.0001,
+                meta={"reason": "no_expert_decision"}
+            )
+            return fallback, [fallback]
+
         return best, decisions

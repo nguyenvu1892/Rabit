@@ -1,33 +1,56 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Protocol, Union
+from typing import Any, Dict, Optional
 
 
 @dataclass
 class ExpertDecision:
     """
-    Normalized decision object returned by experts / gate.
-    Keep fields stable for the rest of the system.
+    Backward-compatible decision object.
+
+    Legacy positional order in older code:
+      ExpertDecision(allow, score, expert, meta)
+
+    Newer code can use keywords:
+      ExpertDecision(allow=True, score=0.1, expert="BASELINE", meta={...}, action="hold")
     """
+    allow: bool
+    score: float
     expert: str
-    score: float = 0.0
-    allow: bool = False
-    action: str = "hold"  # "buy"/"sell"/"hold"
     meta: Dict[str, Any] = field(default_factory=dict)
+    action: str = "hold"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "allow": bool(self.allow),
+            "score": float(self.score),
+            "expert": str(self.expert),
+            "action": str(self.action),
+            "meta": dict(self.meta or {}),
+        }
 
 
-class BaseExpert(Protocol):
+class BaseExpert:
     """
-    Minimal interface for an Expert.
+    Base class for experts.
+
+    Implement either:
+      - decide(features, context) -> ExpertDecision
+    or legacy:
+      - evaluate(features, context) -> ExpertDecision
     """
-    name: str
+    name: str = "BASE"
 
-    def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Any:
-        ...
+    def decide(self, features: Dict[str, Any], context: Dict[str, Any]) -> Optional[ExpertDecision]:
+        # Backward compatibility: if subclass still defines evaluate(), use it.
+        ev = getattr(self, "evaluate", None)
+        if callable(ev):
+            return ev(features, context)  # type: ignore[misc]
+        raise NotImplementedError("Expert must implement decide() or evaluate().")
 
 
-# Backward-compatible alias (some modules import ExpertBase)
+# Backward-compatible alias (some files import ExpertBase)
 ExpertBase = BaseExpert
 
 
