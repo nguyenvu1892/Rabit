@@ -5,10 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 try:
-    # canonical (5.1.x)
     from brain.experts.expert_base import ExpertDecision, ExpertBase
 except Exception:
-    # ultra-compat fallback (avoid import crash)
     @dataclass
     class ExpertDecision:  # type: ignore
         expert: str
@@ -44,14 +42,13 @@ def _coerce_decision(
       - ExpertDecision -> passthrough
       - dict -> parse keys {expert,name,score,allow,action,meta}
       - tuple/list -> (allow, score, action?) or (score, action?) etc.
-      - bool/float/int -> score only
+      - bool/float/int -> score only (bool means allow with score 0/1)
       - None -> None
     """
     if raw is None:
         return None
 
     if isinstance(raw, ExpertDecision):
-        # ensure fields exist
         if getattr(raw, "allow", None) is None:
             raw.allow = True  # type: ignore
         if getattr(raw, "action", None) is None:
@@ -67,7 +64,6 @@ def _coerce_decision(
         action = str(raw.get("action") or "hold")
         meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
 
-        # preserve other keys
         for k, v in raw.items():
             if k not in ("expert", "name", "score", "allow", "action", "meta"):
                 meta.setdefault(k, v)
@@ -141,7 +137,11 @@ def _coerce_decision(
 class ExpertGate:
     """
     Collect expert decisions, apply optional weights, pick best.
-    IMPORTANT: never return None; always fallback to HOLD.
+
+    IMPORTANT:
+    - Never return None. Always provide a safe HOLD fallback.
+    - For learning: even allow=False experts should be eligible to win vs BASELINE,
+      otherwise BASELINE dominates and weights never diversify.
     """
 
     def __init__(
@@ -156,55 +156,31 @@ class ExpertGate:
         self.debug = debug
 
     def _iter_experts(self) -> List[Any]:
-        """
-        Robust registry adapter.
-        This project has multiple registry shapes across versions:
-          - get_all()
-          - experts
-          - _experts
-          - get_experts()
-          - list_experts()
-          - iterable registry (implements __iter__)
-          - plain list/tuple
-        """
-        r = self.registry
-
-        # 1) canonical get_all()
+        # 1) registry.get_all()
         try:
-            xs = r.get_all()  # type: ignore[attr-defined]
+            xs = self.registry.get_all()
             if xs:
                 return list(xs)
         except Exception:
             pass
 
-        # 2) common methods
-        for fn in ("get_experts", "list_experts", "all", "items"):
-            try:
-                f = getattr(r, fn, None)
-                if callable(f):
-                    xs = f()
-                    if xs:
-                        return list(xs)
-            except Exception:
-                pass
-
-        # 3) common attributes
+        # 2) registry.experts / registry._experts
         for attr in ("experts", "_experts"):
             try:
-                xs = getattr(r, attr, None)
+                xs = getattr(self.registry, attr, None)
                 if xs:
                     return list(xs)
             except Exception:
                 pass
 
-        # 4) registry itself is list/tuple
-        if isinstance(r, (list, tuple)):
-            return list(r)
+        # 3) registry itself list/tuple
+        if isinstance(self.registry, (list, tuple)):
+            return list(self.registry)
 
-        # 5) registry is iterable (but not a string/dict)
+        # 4) iterable registry
         try:
-            if isinstance(r, Iterable) and not isinstance(r, (str, bytes, dict)):
-                return list(r)  # type: ignore[arg-type]
+            if isinstance(self.registry, Iterable) and not isinstance(self.registry, (str, bytes, dict)):
+                return list(self.registry)
         except Exception:
             pass
 
@@ -215,7 +191,6 @@ class ExpertGate:
         features: Dict[str, Any],
         context: Dict[str, Any],
     ) -> Tuple[ExpertDecision, List[ExpertDecision]]:
-        regime = None
         try:
             regime = context.get("regime")
         except Exception:
@@ -225,13 +200,12 @@ class ExpertGate:
         experts = self._iter_experts()
 
         if self.debug:
-            names = []
-            for e in experts:
-                names.append(getattr(e, "name", e.__class__.__name__))
+            names = [getattr(e, "name", e.__class__.__name__) for e in experts]
             print("DEBUG REGISTRY EXPERTS:", names)
 
         for exp in experts:
             name = str(getattr(exp, "name", exp.__class__.__name__))
+
             try:
                 raw = exp.decide(features, context)
             except Exception as e:
@@ -249,7 +223,10 @@ class ExpertGate:
             if dec is None:
                 continue
 
-            # Apply weight_store if present: adjusted_score = raw_score * w
+            # keep raw allow for analysis
+            allow_raw = bool(getattr(dec, "allow", True))
+
+            # Apply weight_store if present
             w = 1.0
             if self.weight_store is not None and hasattr(self.weight_store, "get"):
                 try:
@@ -262,34 +239,30 @@ class ExpertGate:
                 dec.meta.setdefault("raw_score", dec.score)
                 dec.meta.setdefault("w", w)
                 dec.meta.setdefault("regime", regime)
-                dec.meta.setdefault("expert", dec.expert)
-                dec.meta.setdefault("action", getattr(dec, "action", "hold"))
+                dec.meta.setdefault("allow_raw", allow_raw)
             except Exception:
                 pass
 
             dec.score = _safe_float(dec.score, 0.0) * _safe_float(w, 1.0)
             decisions.append(dec)
 
-        # HARD FALLBACK: if nothing, create a safe HOLD allow=True
+        # fallback if no decisions
         if not decisions:
             fb = ExpertDecision(
                 expert="FALLBACK",
                 score=0.0,
                 allow=True,
                 action="hold",
-                meta={"reason": "no_expert_decision", "expert": "FALLBACK"},
+                meta={"reason": "no_expert_decision"},
             )
-            if self.debug:
-                print("DEBUG FALLBACK: no decisions -> HOLD")
             return fb, [fb]
 
-        # Prefer allow=True decisions; if none, still pick from all (but still never None)
-        allow_pool = [d for d in decisions if bool(getattr(d, "allow", True))]
-        pool = allow_pool if allow_pool else decisions
-
+        # ======== IMPORTANT CHANGE (learning-friendly selection) ========
+        # Pick best by score among ALL decisions.
+        # Then set allow=True always so system doesn't become deny=100%.
         best: Optional[ExpertDecision] = None
         best_score = float("-inf")
-        for d in pool:
+        for d in decisions:
             s = _safe_float(getattr(d, "score", 0.0), 0.0)
             if s > best_score:
                 best_score = s
@@ -301,15 +274,14 @@ class ExpertGate:
                 score=0.0,
                 allow=True,
                 action="hold",
-                meta={"reason": "best_none_after_pool", "expert": "FALLBACK"},
+                meta={"reason": "best_none_after_scan"},
             )
             decisions.append(best)
 
+        # ensure system-level allow=True
         try:
+            best.allow = True  # type: ignore
             best.meta = best.meta or {}
-            best.meta.setdefault("expert", best.expert)
-            best.meta.setdefault("regime", regime)
-            best.meta.setdefault("action", getattr(best, "action", "hold"))
             best.meta.setdefault("_src", "ExpertGate")
         except Exception:
             pass
