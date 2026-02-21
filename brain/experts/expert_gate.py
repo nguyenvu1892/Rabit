@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
-
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 try:
     # canonical (5.1.x)
@@ -45,7 +44,7 @@ def _coerce_decision(
       - ExpertDecision -> passthrough
       - dict -> parse keys {expert,name,score,allow,action,meta}
       - tuple/list -> (allow, score, action?) or (score, action?) etc.
-      - bool/float/int -> score only (bool means allow with score 0/1)
+      - bool/float/int -> score only
       - None -> None
     """
     if raw is None:
@@ -68,7 +67,7 @@ def _coerce_decision(
         action = str(raw.get("action") or "hold")
         meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
 
-        # preserve any other keys for trace
+        # preserve other keys
         for k, v in raw.items():
             if k not in ("expert", "name", "score", "allow", "action", "meta"):
                 meta.setdefault(k, v)
@@ -79,8 +78,6 @@ def _coerce_decision(
         return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=meta)
 
     if isinstance(raw, (tuple, list)):
-        # Try common patterns
-        # (allow, score, action, meta) or (score, action)...
         allow = True
         score = 0.0
         action = "hold"
@@ -132,7 +129,6 @@ def _coerce_decision(
             meta=fallback_meta or {},
         )
 
-    # unknown type -> best effort
     return ExpertDecision(
         expert=fallback_expert,
         score=0.0,
@@ -145,10 +141,7 @@ def _coerce_decision(
 class ExpertGate:
     """
     Collect expert decisions, apply optional weights, pick best.
-
-    IMPORTANT:
-      Never return (None, []) in normal flow — always fallback to HOLD
-      so the whole system doesn't become deny=100%.
+    IMPORTANT: never return None; always fallback to HOLD.
     """
 
     def __init__(
@@ -163,22 +156,57 @@ class ExpertGate:
         self.debug = debug
 
     def _iter_experts(self) -> List[Any]:
-        # compat registry.get_all() may exist; else registry.experts or registry list
-        try:
-            xs = self.registry.get_all()
-            return list(xs) if xs else []
-        except Exception:
-            pass
+        """
+        Robust registry adapter.
+        This project has multiple registry shapes across versions:
+          - get_all()
+          - experts
+          - _experts
+          - get_experts()
+          - list_experts()
+          - iterable registry (implements __iter__)
+          - plain list/tuple
+        """
+        r = self.registry
 
+        # 1) canonical get_all()
         try:
-            xs = getattr(self.registry, "experts", None)
+            xs = r.get_all()  # type: ignore[attr-defined]
             if xs:
                 return list(xs)
         except Exception:
             pass
 
-        if isinstance(self.registry, (list, tuple)):
-            return list(self.registry)
+        # 2) common methods
+        for fn in ("get_experts", "list_experts", "all", "items"):
+            try:
+                f = getattr(r, fn, None)
+                if callable(f):
+                    xs = f()
+                    if xs:
+                        return list(xs)
+            except Exception:
+                pass
+
+        # 3) common attributes
+        for attr in ("experts", "_experts"):
+            try:
+                xs = getattr(r, attr, None)
+                if xs:
+                    return list(xs)
+            except Exception:
+                pass
+
+        # 4) registry itself is list/tuple
+        if isinstance(r, (list, tuple)):
+            return list(r)
+
+        # 5) registry is iterable (but not a string/dict)
+        try:
+            if isinstance(r, Iterable) and not isinstance(r, (str, bytes, dict)):
+                return list(r)  # type: ignore[arg-type]
+        except Exception:
+            pass
 
         return []
 
@@ -192,12 +220,6 @@ class ExpertGate:
             regime = context.get("regime")
         except Exception:
             regime = None
-
-        regime_conf = None
-        try:
-            regime_conf = context.get("regime_conf")
-        except Exception:
-            regime_conf = None
 
         decisions: List[ExpertDecision] = []
         experts = self._iter_experts()
@@ -213,7 +235,6 @@ class ExpertGate:
             try:
                 raw = exp.decide(features, context)
             except Exception as e:
-                # keep error as a "soft" decision (allow True but hold)
                 dec = ExpertDecision(
                     expert=name,
                     score=0.0,
@@ -236,14 +257,11 @@ class ExpertGate:
                 except Exception:
                     w = 1.0
 
-            # keep raw score in meta for trace
             try:
                 dec.meta = dec.meta or {}
                 dec.meta.setdefault("raw_score", dec.score)
                 dec.meta.setdefault("w", w)
                 dec.meta.setdefault("regime", regime)
-                dec.meta.setdefault("regime_conf", regime_conf)
-                # ✅ inject expert name early too (useful for snapshot)
                 dec.meta.setdefault("expert", dec.expert)
                 dec.meta.setdefault("action", getattr(dec, "action", "hold"))
             except Exception:
@@ -265,11 +283,10 @@ class ExpertGate:
                 print("DEBUG FALLBACK: no decisions -> HOLD")
             return fb, [fb]
 
-        # Prefer allow=True decisions; if none, still fallback to HOLD allow=True
+        # Prefer allow=True decisions; if none, still pick from all (but still never None)
         allow_pool = [d for d in decisions if bool(getattr(d, "allow", True))]
         pool = allow_pool if allow_pool else decisions
 
-        # pick best by score
         best: Optional[ExpertDecision] = None
         best_score = float("-inf")
         for d in pool:
@@ -288,13 +305,10 @@ class ExpertGate:
             )
             decisions.append(best)
 
-        # ✅ CRITICAL: ensure snapshot has expert (OutcomeUpdater needs it)
-        # We do NOT remove any existing meta; only setdefault.
         try:
             best.meta = best.meta or {}
             best.meta.setdefault("expert", best.expert)
             best.meta.setdefault("regime", regime)
-            best.meta.setdefault("regime_conf", regime_conf)
             best.meta.setdefault("action", getattr(best, "action", "hold"))
             best.meta.setdefault("_src", "ExpertGate")
         except Exception:
