@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
+from brain.features.feature_pack_v1 import FeaturePackV1
 import random
 import traceback
 
@@ -153,6 +154,8 @@ class ShadowRunner:
             stats.steps += 1
             window = candles[i - lookback : i]
             trade_features = {"candles": window, "step": i}
+            if "candles" in trade_features:
+                trade_features.update(FeaturePackV1.compute(trade_features["candles"]))
 
             try:
                 allow, score, risk_cfg = self.de.evaluate_trade(trade_features)
