@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+import math
 
 
 @dataclass(frozen=True)
@@ -14,51 +15,64 @@ class RegimeResult:
 
 
 class RegimeDetector:
-    """
-    Regime logic (giữ nguyên ý tưởng cũ):
-      - trend: slope cao và đủ tự tin
-      - breakout: vol cao và đủ tự tin
-      - range: còn lại
-    Upgrade 5.1.8:
-      - Nếu features không có vol/slope, tự suy ra từ candles (close series)
-        để tránh regime bị "unknown" hoặc vô nghĩa.
-    """
 
-    def __init__(self, *, debug: bool = False) -> None:
-        self.debug = debug
+    def __init__(
+        self,
+        *,
+        debug: bool = False,
+        window: int = 32,
+        min_slope_th: float = 0.0010,
+        min_vol_th: float = 0.0015,
+    ) -> None:
+        self.debug = bool(debug)
+        self.window = int(window) if window and window > 2 else 32
+        self.min_slope_th = float(min_slope_th)
+        self.min_vol_th = float(min_vol_th)
 
+    def _dprint(self, *args: Any) -> None:
+        if self.debug:
+            try:
+                print(*args)
+            except Exception:
+                pass
+
+    # ==============================
+    # FIX: parse tab-separated candle
+    # ==============================
     def _extract_closes(self, candles: Any) -> List[float]:
         closes: List[float] = []
+
         if candles is None:
             return closes
 
-        # candles can be: list[dict], list[list/tuple], list[float]
         try:
             for c in candles:
-                if c is None:
-                    continue
-                if isinstance(c, (int, float)):
-                    closes.append(float(c))
-                    continue
+
+                # case 1: dict with tab-separated string value
+                if isinstance(c, dict) and len(c) == 1:
+                    raw = list(c.values())[0]
+                    if isinstance(raw, str):
+                        parts = raw.split("\t")
+                        if len(parts) >= 6:
+                            closes.append(float(parts[5]))
+                            continue
+
+                # case 2: dict normal OHLC
                 if isinstance(c, dict):
-                    # common keys
-                    if "close" in c:
-                        closes.append(float(c["close"]))
-                    elif "c" in c:
-                        closes.append(float(c["c"]))
-                    else:
-                        # try last numeric value
-                        for k in ("Close", "CLOSE", "price", "last"):
-                            if k in c:
-                                closes.append(float(c[k]))
-                                break
+                    for k in ("close", "c", "Close", "CLOSE"):
+                        if k in c:
+                            closes.append(float(c[k]))
+                            break
                     continue
+
+                # case 3: list/tuple OHLC
                 if isinstance(c, (list, tuple)):
-                    # heuristics: often [t, o, h, l, c, v] or [o,h,l,c]
                     if len(c) >= 5:
                         closes.append(float(c[4]))
                     elif len(c) >= 4:
                         closes.append(float(c[3]))
+                    continue
+
         except Exception:
             return closes
 
@@ -69,70 +83,78 @@ class RegimeDetector:
         if n < 3:
             return 0.0, 0.0
 
-        # slope: normalized delta over window
-        first = closes[0]
-        last = closes[-1]
-        denom = abs(first) if abs(first) > 1e-9 else 1.0
-        slope = (last - first) / denom  # normalized
+        w = closes[-self.window:] if n > self.window else closes
+        if len(w) < 3:
+            return 0.0, 0.0
 
-        # vol: mean absolute return
-        rets: List[float] = []
-        for i in range(1, n):
-            prev = closes[i - 1]
-            cur = closes[i]
+        first = w[0]
+        last = w[-1]
+
+        denom = abs(first) if abs(first) > 1e-9 else 1.0
+        slope = (last - first) / denom
+
+        rets = []
+        for i in range(1, len(w)):
+            prev = w[i - 1]
+            cur = w[i]
             d = abs(prev) if abs(prev) > 1e-9 else 1.0
             rets.append((cur - prev) / d)
 
         if not rets:
-            vol = 0.0
-        else:
-            vol = sum(abs(r) for r in rets) / float(len(rets))
+            return float(slope), 0.0
 
+        vol = sum(abs(r) for r in rets) / len(rets)
         return float(slope), float(vol)
 
-    def detect(self, features: Dict[str, Any]) -> RegimeResult:
-        # Hardening: features may not be dict in some call paths → avoid crashing.
-        if not isinstance(features, dict):
-            return RegimeResult(regime="unknown", vol=0.0, slope=0.0, confidence=0.0)
-
-        # Prefer explicit vol/slope if provided
-        vol = 0.0
-        slope = 0.0
+    def _sigmoid(self, x: float) -> float:
         try:
-            if "vol" in features and features["vol"] is not None:
-                vol = float(features.get("vol") or 0.0)
-            if "slope" in features and features["slope"] is not None:
-                slope = float(features.get("slope") or 0.0)
+            return 1.0 / (1.0 + math.exp(-x))
         except Exception:
-            vol, slope = 0.0, 0.0
+            return 0.5
 
-        # If missing -> infer from candles
-        if (vol == 0.0 and slope == 0.0) and ("candles" in features):
-            closes = self._extract_closes(features.get("candles"))
-            s, v = self._compute_slope_vol(closes)
-            slope = float(slope or s)
-            vol = float(vol or v)
+    def _clamp(self, x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
 
-        # Base regime
-        regime = "range"
-        if abs(slope) > 0.002:
-            regime = "trend"
-        if vol > 0.003:
-            regime = "breakout"
+    def detect(self, features: Dict[str, Any]) -> RegimeResult:
+        if not isinstance(features, dict):
+            return RegimeResult("unknown", 0.0, 0.0, 0.0)
 
-        # Confidence (giữ logic cũ, nhưng đảm bảo không luôn = 0)
-        confidence = 0.55
-        confidence += min(abs(slope) * 40.0, 0.25)
-        confidence += min(vol * 40.0, 0.20)
-        if confidence > 0.99:
-            confidence = 0.99
-        if confidence < 0.0:
-            confidence = 0.0
+        candles = features.get("candles")
+        closes = self._extract_closes(candles)
 
-        if self.debug:
-            try:
-                print("DEBUG REGIME:", regime, "vol=", vol, "slope=", slope, "conf=", confidence)
-            except Exception:
-                pass
+        slope, vol = self._compute_slope_vol(closes)
 
-        return RegimeResult(regime=regime, vol=float(vol), slope=float(slope), confidence=float(confidence))
+        abs_vol = abs(vol)
+        abs_slope = abs(slope)
+
+        slope_th = max(self.min_slope_th, 2.6 * abs_vol)
+        vol_th = max(self.min_vol_th, 2.2 * abs_vol + self.min_vol_th * 0.5)
+
+        if abs_slope > slope_th:
+            regime = "trend_up" if slope > 0 else "trend_down"
+        else:
+            regime = "volatile" if abs_vol > vol_th else "range"
+
+        rel_trend = abs_slope / (slope_th + 1e-12)
+        rel_vol = abs_vol / (vol_th + 1e-12)
+
+        trend_conf = self._sigmoid(2.0 * (rel_trend - 1.0))
+        vol_conf = self._sigmoid(2.0 * (rel_vol - 1.0))
+
+        confidence = 0.52
+        if regime.startswith("trend_"):
+            confidence += 0.28 * trend_conf + 0.10 * vol_conf
+        elif regime == "volatile":
+            confidence += 0.25 * vol_conf + 0.05 * (1.0 - trend_conf)
+        else:
+            confidence += 0.18 * (1.0 - trend_conf) + 0.08 * (1.0 - vol_conf)
+
+        confidence = self._clamp(confidence, 0.20, 0.99)
+
+        self._dprint(
+            "REGIME DEBUG | slope=", slope,
+            "vol=", vol,
+            "=>", regime
+        )
+
+        return RegimeResult(regime, vol, slope, confidence)

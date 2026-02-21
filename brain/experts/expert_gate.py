@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Iterable, Union
+from typing import Any, Dict, List, Optional, Tuple
+
 
 try:
     # canonical (5.1.x)
@@ -19,6 +20,7 @@ except Exception:
 
     class ExpertBase:  # type: ignore
         name: str = "BASE"
+
         def decide(self, features: Dict[str, Any], context: Dict[str, Any]) -> Any:
             return None
 
@@ -36,15 +38,15 @@ def _coerce_decision(
     raw: Any,
     *,
     fallback_expert: str = "UNKNOWN",
-    fallback_meta: Optional[Dict[str, Any]] = None
+    fallback_meta: Optional[Dict[str, Any]] = None,
 ) -> Optional[ExpertDecision]:
     """
     Compat layer:
-    - ExpertDecision -> passthrough
-    - dict -> parse keys {expert,name,score,allow,action,meta}
-    - tuple/list -> (allow, score, action?) or (score, action?) etc.
-    - bool/float/int -> score only (bool means allow with score 0/1)
-    - None -> None
+      - ExpertDecision -> passthrough
+      - dict -> parse keys {expert,name,score,allow,action,meta}
+      - tuple/list -> (allow, score, action?) or (score, action?) etc.
+      - bool/float/int -> score only (bool means allow with score 0/1)
+      - None -> None
     """
     if raw is None:
         return None
@@ -65,38 +67,36 @@ def _coerce_decision(
         allow = bool(raw.get("allow", True))
         action = str(raw.get("action") or "hold")
         meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
-        # preserve any other keys
+
+        # preserve any other keys for trace
         for k, v in raw.items():
             if k not in ("expert", "name", "score", "allow", "action", "meta"):
                 meta.setdefault(k, v)
+
         if fallback_meta:
             meta = {**fallback_meta, **meta}
+
         return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=meta)
 
     if isinstance(raw, (tuple, list)):
         # Try common patterns
-        # (allow, score, action, meta)
+        # (allow, score, action, meta) or (score, action)...
         allow = True
         score = 0.0
         action = "hold"
         meta: Dict[str, Any] = {}
 
         if len(raw) >= 1:
-            # first could be allow or score
             if isinstance(raw[0], bool):
                 allow = bool(raw[0])
             else:
                 score = _safe_float(raw[0], 0.0)
 
         if len(raw) >= 2:
-            # second could be score or action
             if isinstance(raw[1], (int, float)) and not isinstance(raw[1], bool):
                 score = _safe_float(raw[1], score)
             elif isinstance(raw[1], str):
                 action = raw[1]
-            else:
-                # ignore
-                pass
 
         if len(raw) >= 3:
             if isinstance(raw[2], str):
@@ -115,12 +115,22 @@ def _coerce_decision(
         return ExpertDecision(expert=fallback_expert, score=score, allow=allow, action=action, meta=meta)
 
     if isinstance(raw, bool):
-        return ExpertDecision(expert=fallback_expert, score=1.0 if raw else 0.0, allow=True, action="hold",
-                              meta=fallback_meta or {})
+        return ExpertDecision(
+            expert=fallback_expert,
+            score=1.0 if raw else 0.0,
+            allow=True,
+            action="hold",
+            meta=fallback_meta or {},
+        )
 
     if isinstance(raw, (int, float)):
-        return ExpertDecision(expert=fallback_expert, score=_safe_float(raw, 0.0), allow=True, action="hold",
-                              meta=fallback_meta or {})
+        return ExpertDecision(
+            expert=fallback_expert,
+            score=_safe_float(raw, 0.0),
+            allow=True,
+            action="hold",
+            meta=fallback_meta or {},
+        )
 
     # unknown type -> best effort
     return ExpertDecision(
@@ -135,8 +145,10 @@ def _coerce_decision(
 class ExpertGate:
     """
     Collect expert decisions, apply optional weights, pick best.
-    IMPORTANT: Never return (None, []) in normal flow — always fallback to HOLD
-    so the whole system doesn't become deny=100%.
+
+    IMPORTANT:
+      Never return (None, []) in normal flow — always fallback to HOLD
+      so the whole system doesn't become deny=100%.
     """
 
     def __init__(
@@ -157,14 +169,17 @@ class ExpertGate:
             return list(xs) if xs else []
         except Exception:
             pass
+
         try:
             xs = getattr(self.registry, "experts", None)
             if xs:
                 return list(xs)
         except Exception:
             pass
+
         if isinstance(self.registry, (list, tuple)):
             return list(self.registry)
+
         return []
 
     def pick(
@@ -177,6 +192,12 @@ class ExpertGate:
             regime = context.get("regime")
         except Exception:
             regime = None
+
+        regime_conf = None
+        try:
+            regime_conf = context.get("regime_conf")
+        except Exception:
+            regime_conf = None
 
         decisions: List[ExpertDecision] = []
         experts = self._iter_experts()
@@ -221,6 +242,10 @@ class ExpertGate:
                 dec.meta.setdefault("raw_score", dec.score)
                 dec.meta.setdefault("w", w)
                 dec.meta.setdefault("regime", regime)
+                dec.meta.setdefault("regime_conf", regime_conf)
+                # ✅ inject expert name early too (useful for snapshot)
+                dec.meta.setdefault("expert", dec.expert)
+                dec.meta.setdefault("action", getattr(dec, "action", "hold"))
             except Exception:
                 pass
 
@@ -234,7 +259,7 @@ class ExpertGate:
                 score=0.0,
                 allow=True,
                 action="hold",
-                meta={"reason": "no_expert_decision"},
+                meta={"reason": "no_expert_decision", "expert": "FALLBACK"},
             )
             if self.debug:
                 print("DEBUG FALLBACK: no decisions -> HOLD")
@@ -245,7 +270,7 @@ class ExpertGate:
         pool = allow_pool if allow_pool else decisions
 
         # pick best by score
-        best = None
+        best: Optional[ExpertDecision] = None
         best_score = float("-inf")
         for d in pool:
             s = _safe_float(getattr(d, "score", 0.0), 0.0)
@@ -259,9 +284,21 @@ class ExpertGate:
                 score=0.0,
                 allow=True,
                 action="hold",
-                meta={"reason": "best_none_after_pool"},
+                meta={"reason": "best_none_after_pool", "expert": "FALLBACK"},
             )
             decisions.append(best)
+
+        # ✅ CRITICAL: ensure snapshot has expert (OutcomeUpdater needs it)
+        # We do NOT remove any existing meta; only setdefault.
+        try:
+            best.meta = best.meta or {}
+            best.meta.setdefault("expert", best.expert)
+            best.meta.setdefault("regime", regime)
+            best.meta.setdefault("regime_conf", regime_conf)
+            best.meta.setdefault("action", getattr(best, "action", "hold"))
+            best.meta.setdefault("_src", "ExpertGate")
+        except Exception:
+            pass
 
         if self.debug:
             try:

@@ -41,7 +41,7 @@ class DecisionEngine:
         self.trade_memory = trade_memory
         self.debug = debug
 
-        self.regime_detector = RegimeDetector(debug=debug)
+        self.regime_detector = RegimeDetector(debug=False)
         self.meta = MetaController(meta_cfg or MetaConfig(debug=debug))
 
         # build registry + gate (compat)
@@ -134,6 +134,23 @@ class DecisionEngine:
                 risk_cfg.setdefault("regime_conf", rr.confidence)
                 risk_cfg.setdefault("vol", rr.vol)
                 risk_cfg.setdefault("slope", rr.slope)
+                    # inject expert/action for online learning (OutcomeUpdater reads these)
+                try:
+                    if isinstance(risk_cfg, dict):
+                        best_expert = str(getattr(best, "expert", "") or "")
+                        best_action = str(getattr(best, "action", "hold") or "hold")
+
+                        if best_expert:
+                            risk_cfg.setdefault("expert", best_expert)
+
+                            m = risk_cfg.get("meta")
+                            if not isinstance(m, dict):
+                                m = {}
+                                risk_cfg["meta"] = m
+                            m.setdefault("expert", best_expert)
+                            m.setdefault("action", best_action)
+                except Exception:
+                    pass
                 # thêm 1 field tiện debug
                 risk_cfg.setdefault("_regime_src", "DecisionEngine")
         except Exception:
