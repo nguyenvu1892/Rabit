@@ -46,6 +46,8 @@ class DecisionEngine:
 
         # build registry + gate (compat)
         self.registry = self._build_registry()
+        if ExpertGate is None:
+            raise ImportError("ExpertGate is not available (brain.experts.expert_gate import failed).")
         self.gate = ExpertGate(self.registry, weight_store=self.weight_store, debug=debug)
 
     def _build_registry(self) -> Any:
@@ -58,26 +60,30 @@ class DecisionEngine:
 
         try:
             from brain.experts.experts_basic import DEFAULT_EXPERTS
-            # DEFAULT_EXPERTS might be list of ExpertBase
+
+            # DEFAULT_EXPERTS might be list of ExpertBase instances/classes
             class _TmpRegistry:
                 def __init__(self, xs):
                     self._xs = xs
+
                 def get_all(self):
                     return list(self._xs)
+
             return _TmpRegistry(DEFAULT_EXPERTS)
         except Exception:
             # last resort empty registry
             class _Empty:
                 def get_all(self):
                     return []
+
             return _Empty()
 
     def evaluate_trade(self, features: Dict[str, Any]) -> Tuple[bool, float, Dict[str, Any]]:
         """
-        Returns:
-          allow(bool), score(float), risk_cfg(dict)
-        NOTE: allow here means "system produced a decision" (even if HOLD),
-              not necessarily open position.
+        Returns: allow(bool), score(float), risk_cfg(dict)
+        NOTE:
+          - allow here means "system produced a decision event" (even if HOLD),
+            not necessarily open position.
         """
         # 1) detect regime
         rr: RegimeResult = self.regime_detector.detect(features)
@@ -86,6 +92,8 @@ class DecisionEngine:
         context: Dict[str, Any] = {
             "regime": rr.regime,
             "regime_conf": rr.confidence,
+            "vol": rr.vol,
+            "slope": rr.slope,
         }
         if self.trade_memory is not None:
             context["trade_memory"] = self.trade_memory
@@ -117,17 +125,31 @@ class DecisionEngine:
         except Exception as e:
             risk_cfg = {"risk_error": repr(e)}
 
+        # --- FIX TRIỆT ĐỂ unknown/conf_sum=0 ---
+        # ShadowRunner đang lấy regime/conf từ risk_cfg.
+        # Vì vậy luôn inject thông tin regime vào risk_cfg (KHÔNG override nếu risk_engine đã set).
+        try:
+            if isinstance(risk_cfg, dict):
+                risk_cfg.setdefault("regime", rr.regime)
+                risk_cfg.setdefault("regime_conf", rr.confidence)
+                risk_cfg.setdefault("vol", rr.vol)
+                risk_cfg.setdefault("slope", rr.slope)
+                # thêm 1 field tiện debug
+                risk_cfg.setdefault("_regime_src", "DecisionEngine")
+        except Exception:
+            pass
+        # ---------------------------------------
+
         # 6) output
         allow = bool(getattr(best, "allow", True))
-        score = 0.0
+
         try:
             score = float(getattr(best, "score", 0.0) or 0.0)
         except Exception:
             score = 0.0
 
-        # ensure allow is not global-deny (unless explicitly desired)
+        # ensure HOLD is a valid decision event (do not global-deny HOLD)
         if allow is False and getattr(best, "action", "hold") == "hold":
-            # HOLD should still be allowed as a valid decision event
             allow = True
 
         return allow, score, risk_cfg
