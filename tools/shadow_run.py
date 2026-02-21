@@ -2,206 +2,152 @@
 from __future__ import annotations
 
 import argparse
-import random
+import inspect
+import json
+from pathlib import Path
 from typing import Any, Dict, Optional
 
-from sim.candle_loader import load_candles_csv
+from brain.decision_engine import DecisionEngine
+from brain.weight_store import WeightStore
+from observer.eval_reporter import EvalReporter
+from observer.outcome_updater import OutcomeUpdater
 from sim.shadow_runner import ShadowRunner
 
-from brain.decision_engine import DecisionEngine
-from brain.journal import Journal
-from brain.trade_memory import TradeMemory
-from brain.reinforcement_learner import ReinforcementLearner
-from brain.weight_store import WeightStore
 
-from observer.outcome_updater import OutcomeUpdater
-
-# Optional: evaluation reporter (5.1.1)
-try:
-    from observer.eval_reporter import EvalReporter
-except Exception:  # pragma: no cover
-    EvalReporter = None  # type: ignore
-
-
-def _import_risk_engine():
-    # Project structure moved a few times; support both.
+def _safe_int(x, default: int) -> int:
     try:
-        from risk.risk_engine import RiskEngine  # type: ignore
-
-        return RiskEngine
+        return int(x)
     except Exception:
-        try:
-            from brain.risk_engine import RiskEngine  # type: ignore
-
-            return RiskEngine
-        except Exception:
-            from risk_engine import RiskEngine  # type: ignore
-
-            return RiskEngine
+        return default
 
 
-def _stats_to_dict(stats: Any) -> Dict[str, Any]:
-    if stats is None:
-        return {}
-    if isinstance(stats, dict):
-        return stats
-    if hasattr(stats, "to_dict") and callable(getattr(stats, "to_dict")):
-        try:
-            return dict(stats.to_dict())
-        except Exception:
-            pass
-
-    d: Dict[str, Any] = {}
-    for k in [
-        "steps",
-        "decisions",
-        "allow",
-        "deny",
-        "errors",
-        "outcomes",
-        "wins",
-        "losses",
-        "total_pnl",
-        "forced_entries",
-    ]:
-        if hasattr(stats, k):
-            d[k] = getattr(stats, k)
-    return d
-
-
-def _weight_pair_count(ws: Optional[WeightStore]) -> int:
-    if ws is None:
-        return 0
+def _call_with_signature(fn, /, *args, **kwargs):
+    """
+    Call fn with kwargs filtered by its signature to avoid:
+    - unexpected keyword argument
+    - multiple values for argument
+    """
     try:
-        d = ws.to_dict()
-        return sum(len(sub) for sub in d.values())
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+        if accepts_var_kw:
+            return fn(*args, **kwargs)
+
+        filtered = {}
+        for k, v in kwargs.items():
+            if k in params:
+                filtered[k] = v
+        return fn(*args, **filtered)
     except Exception:
-        try:
-            return len(ws)  # type: ignore
-        except Exception:
-            return 0
+        # last resort: raw call
+        return fn(*args, **kwargs)
+
+
+def load_csv_candles(csv_path: str, limit: int) -> list:
+    # existing project already has loaders in other places,
+    # but keep minimal fallback to not break.
+    import csv
+
+    rows = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for i, row in enumerate(r):
+            rows.append(row)
+            if limit > 0 and i + 1 >= limit:
+                break
+    return rows
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
-    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--limit", type=int, default=5000)
     ap.add_argument("--lookback", type=int, default=300)
     ap.add_argument("--max-steps", type=int, default=2000)
-    ap.add_argument("--train", action="store_true")
     ap.add_argument("--horizon", type=int, default=30)
-
-    # exploration (owned by ShadowRunner)
+    ap.add_argument("--train", action="store_true")
     ap.add_argument("--epsilon", type=float, default=0.0)
     ap.add_argument("--epsilon-cooldown", type=int, default=0)
-
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--journal", type=str, default=None, help="path to journal jsonl (append)")
-
-    # weights (5.0.8.x)
-    ap.add_argument("--weights", type=str, default=None, help="path to weights json (load+save)")
-
-    # reporting (5.1.1)
-    ap.add_argument("--report-dir", type=str, default="data/reports")
-
+    ap.add_argument("--journal", default=None)
+    ap.add_argument("--weights", default=None)
     args = ap.parse_args()
 
-    random.seed(args.seed)
-
-    candles = load_candles_csv(args.csv, limit=args.limit)
-    journal = Journal(args.journal) if args.journal else None
-
-    # Weight store
-    weight_store: Optional[WeightStore] = None
+    # weight store
+    weight_store = WeightStore()
     if args.weights:
-        # init with path => auto-load if file exists
-        weight_store = WeightStore(path=args.weights)
-
-    # Reporter (optional)
-    reporter = None
-    if EvalReporter is not None and args.report_dir:
         try:
-            reporter = EvalReporter(out_dir=args.report_dir)
-            if weight_store is not None and hasattr(reporter, "snapshot_weights_before"):
-                reporter.snapshot_weights_before(weight_store)
+            weight_store.load(args.weights)
         except Exception:
-            reporter = None
+            pass
 
-    trade_memory = TradeMemory() if args.train else None
-
-    learner = None
-    outcome_updater = None
-    if args.train:
-        learner = ReinforcementLearner(weight_store=weight_store)
-        outcome_updater = OutcomeUpdater(
-            learner=learner,
-            trade_memory=trade_memory,
-            weight_store=weight_store,
-            weights_path=args.weights,
-            autosave=True,
-        )
-
-    RiskEngine = _import_risk_engine()
-    risk_engine = RiskEngine()
-
+    # decision engine
     de = DecisionEngine(
-        risk_engine=risk_engine,
+        risk_engine=None,
         weight_store=weight_store,
     )
 
+    # reporter
+    reporter = EvalReporter(out_dir="data/reports")
+
+    # outcome updater (compat: accept learner/trade_memory kwargs if older versions call it)
+    outcome_updater = OutcomeUpdater(
+        weight_store=weight_store,
+        autosave=True,
+        weights_path=args.weights or "data/weights.json",
+        journal_path=args.journal or "data/journal_train.jsonl",
+    )
+
+    # runner (compat: accept risk_engine kw)
     runner = ShadowRunner(
-        de,
-        risk_engine=risk_engine,
+        decision_engine=de,
+        risk_engine=None,
         outcome_updater=outcome_updater,
         seed=args.seed,
         train=args.train,
     )
 
-    stats = runner.run(
-        candles=candles,
-        lookback=args.lookback,
-        max_steps=args.max_steps,
-        horizon=args.horizon,
-        train=args.train,
-        epsilon=args.epsilon,
-        epsilon_cooldown=args.epsilon_cooldown,
-        journal=journal,
-    )
+    candles = load_csv_candles(args.csv, args.limit)
 
-    stats_dict = _stats_to_dict(stats)
+    run_kwargs: Dict[str, Any] = {
+        "lookback": _safe_int(args.lookback, 300),
+        "max_steps": _safe_int(args.max_steps, 2000),
+        "horizon": _safe_int(args.horizon, 30),
+        "train": bool(args.train),
+        "epsilon": float(args.epsilon),
+        "epsilon_cooldown": _safe_int(args.epsilon_cooldown, 0),
+        "journal": None,  # keep journal None unless you have journal object
+    }
 
-    # Reporter finalize
-    if reporter is not None:
-        try:
-            if weight_store is not None and hasattr(reporter, "snapshot_weights_after"):
-                reporter.snapshot_weights_after(weight_store)
+    stats = _call_with_signature(runner.run, candles, **run_kwargs)
 
-            if hasattr(reporter, "write") and callable(getattr(reporter, "write")):
-                reporter.write(
-                    stats=stats_dict,
-                    extra={
-                        "csv": args.csv,
-                        "limit": args.limit,
-                        "lookback": args.lookback,
-                        "max_steps": args.max_steps,
-                        "horizon": args.horizon,
-                        "train": args.train,
-                        "epsilon": args.epsilon,
-                        "epsilon_cooldown": args.epsilon_cooldown,
-                        "seed": args.seed,
-                        "journal": args.journal,
-                        "weights": args.weights,
-                    },
-                )
-            elif hasattr(reporter, "finalize") and callable(getattr(reporter, "finalize")):
-                reporter.finalize(stats=stats_dict)
-        except Exception as e:
-            print(f"[shadow_run] WARN: reporter finalize failed: {e}")
+    # snapshot weights
+    try:
+        reporter.snapshot_weights_before(weight_store)
+    except Exception:
+        pass
+
+    # finalize report
+    try:
+        reporter.finalize(stats.to_dict() if hasattr(stats, "to_dict") else dict(stats.__dict__))
+    except Exception:
+        pass
 
     print("=== SHADOW RUN DONE ===")
-    print("WEIGHT SIZE:", _weight_pair_count(weight_store))
-    for k, v in stats_dict.items():
-        print(f"{k}: {v}")
+    # printing robust
+    payload = stats.to_dict() if hasattr(stats, "to_dict") else dict(stats.__dict__)
+    for k in ["steps", "decisions", "allow", "deny", "errors", "outcomes", "wins", "losses", "total_pnl", "forced_entries"]:
+        if k in payload:
+            print(f"{k}: {payload[k]}")
+    if "regime_breakdown" in payload:
+        print("regime_breakdown:", payload["regime_breakdown"])
+
+    try:
+        reporter.snapshot_weights_after(weight_store)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

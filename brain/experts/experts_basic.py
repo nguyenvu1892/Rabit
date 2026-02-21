@@ -1,12 +1,43 @@
 # brain/experts/experts_basic.py
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from brain.experts.expert_base import ExpertBase, ExpertDecision
+
+# --- Robust imports (NEVER crash this module) ---
+try:
+    from brain.experts.expert_base import ExpertBase, ExpertDecision
+except Exception:
+    # Ultra-compat fallback: keep system alive even if expert_base is unstable.
+    class ExpertBase:  # type: ignore
+        name: str = "BASE"
+
+        def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Any:
+            return None
+
+    @dataclass
+    class ExpertDecision:  # type: ignore
+        expert: str
+        allow: bool = True
+        score: float = 0.0
+        action: str = "hold"
+        meta: Dict[str, Any] = field(default_factory=dict)
 
 
-class TrendMAExpert:
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+# ----------------------------
+# Experts
+# ----------------------------
+class TrendMAExpert(ExpertBase):
     name = "TREND_MA"
 
     def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> ExpertDecision:
@@ -21,7 +52,7 @@ class TrendMAExpert:
                 meta={"reason": "not_enough_data", "n": len(candles)},
             )
 
-        closes = [float(x.get("c", x.get("close"))) for x in candles[-50:]]
+        closes = [_safe_float(x.get("c", x.get("close")), 0.0) for x in candles[-50:]]
         ma_fast = sum(closes[-10:]) / 10.0
         ma_slow = sum(closes) / 50.0
 
@@ -30,7 +61,8 @@ class TrendMAExpert:
         else:
             score, allow = 0.35, False
 
-        if (context.get("regime") or "") == "trend":
+        # regime booster (tùy ý)
+        if (context.get("regime") or "") in ("trend_up", "trend_down", "trend"):
             score += 0.15
 
         return ExpertDecision(
@@ -42,7 +74,7 @@ class TrendMAExpert:
         )
 
 
-class MeanRevertExpert:
+class MeanRevertExpert(ExpertBase):
     name = "MEAN_REVERT"
 
     def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> ExpertDecision:
@@ -57,7 +89,7 @@ class MeanRevertExpert:
                 meta={"reason": "not_enough_data", "n": len(candles)},
             )
 
-        closes = [float(x.get("c", x.get("close"))) for x in candles[-60:]]
+        closes = [_safe_float(x.get("c", x.get("close")), 0.0) for x in candles[-60:]]
         mean = sum(closes) / 60.0
         last = closes[-1]
         dist = abs(last - mean)
@@ -75,7 +107,7 @@ class MeanRevertExpert:
         )
 
 
-class BreakoutExpert:
+class BreakoutExpert(ExpertBase):
     name = "BREAKOUT"
 
     def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> ExpertDecision:
@@ -90,15 +122,17 @@ class BreakoutExpert:
                 meta={"reason": "not_enough_data", "n": len(candles)},
             )
 
-        closes = [float(x.get("c", x.get("close"))) for x in candles[-40:]]
+        closes = [_safe_float(x.get("c", x.get("close")), 0.0) for x in candles[-40:]]
         hi, lo, last = max(closes[:-1]), min(closes[:-1]), closes[-1]
-        broke = (last > hi) or (last < lo)
 
+        broke = (last > hi) or (last < lo)
         score = 0.75 if broke else 0.2
+
         if (context.get("regime") or "") == "breakout":
             score += 0.15
 
         allow = score >= 0.8
+
         return ExpertDecision(
             expert=self.name,
             allow=allow,
@@ -108,21 +142,22 @@ class BreakoutExpert:
         )
 
 
-class BaselineExpert:
+class BaselineExpert(ExpertBase):
     name = "BASELINE"
 
     def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> ExpertDecision:
+        # Always allow with tiny score so the system never goes empty.
         return ExpertDecision(
             expert=self.name,
             allow=True,
-            score=0.0001,  # tiny >0 so it can be selected if needed
+            score=0.0001,
             action="hold",
             meta={"reason": "baseline"},
         )
 
 
 # Default experts used by DecisionEngine/registry bootstrap
-DEFAULT_EXPERTS: List[ExpertBase] = [
+DEFAULT_EXPERTS: List[Any] = [
     BaselineExpert(),
     TrendMAExpert(),
     MeanRevertExpert(),
@@ -136,7 +171,6 @@ def register_basic_experts(registry: Any) -> None:
         for e in DEFAULT_EXPERTS:
             registry.register(e)
         return
-
     if hasattr(registry, "add"):
         for e in DEFAULT_EXPERTS:
             registry.add(e)

@@ -31,19 +31,12 @@ class ShadowStats:
     allow: int = 0
     deny: int = 0
     errors: int = 0
-
     outcomes: int = 0
     wins: int = 0
     losses: int = 0
     total_pnl: float = 0.0
-
     forced_entries: int = 0
 
-    # ✅ NEW: regime-first breakdown
-    # structure:
-    # {
-    #   "trend": {"decisions":..,"allow":..,"deny":..,"outcomes":..,"wins":..,"losses":..,"pnl":..,"forced":..,"conf_sum":..,"conf_n":..}
-    # }
     regime_breakdown: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def _rb_row(self, regime: str) -> Dict[str, Any]:
@@ -77,12 +70,19 @@ class ShadowStats:
             "losses": self.losses,
             "total_pnl": self.total_pnl,
             "forced_entries": self.forced_entries,
-            # ✅ NEW
             "regime_breakdown": self.regime_breakdown,
         }
 
 
 class ShadowRunner:
+    """
+    Compat-first ShadowRunner:
+
+    - __init__ accepts risk_engine (optional) to avoid 'unexpected keyword'
+    - run() accepts candles in many forms:
+        run(candles, ...) OR run(candles=...) OR run(rows=...) OR run(data=...)
+    """
+
     def __init__(
         self,
         decision_engine,
@@ -90,6 +90,7 @@ class ShadowRunner:
         outcome_updater=None,
         seed: Optional[int] = None,
         train: bool = False,
+        **kwargs,
     ) -> None:
         self.de = decision_engine
         self.risk_engine = risk_engine
@@ -106,7 +107,10 @@ class ShadowRunner:
 
     def run(
         self,
-        candles,
+        candles=None,
+        *,
+        rows=None,
+        data=None,
         lookback: int = 300,
         max_steps: int = 2000,
         horizon: int = 30,
@@ -114,20 +118,24 @@ class ShadowRunner:
         epsilon: float = 0.0,
         epsilon_cooldown: int = 0,
         journal=None,
+        **kwargs,
     ) -> ShadowStats:
-        # unify train flag (không bị “lạc”)
+        # compat input selection
+        if candles is None:
+            candles = rows if rows is not None else data
+
+        # if still None -> nothing to do
+        stats = ShadowStats()
+        if candles is None:
+            return stats
+
         train_mode = self.train if train is None else bool(train)
 
-        stats = ShadowStats()
-        n = len(candles)
-
-        # push exploration config into decision engine (nếu có)
+        # push exploration config into decision engine (if supported)
         if hasattr(self.de, "set_exploration"):
             try:
-                # new signature: set_exploration(epsilon=..., cooldown=...)
                 self.de.set_exploration(epsilon=float(epsilon), cooldown=int(epsilon_cooldown))
             except TypeError:
-                # old signature: set_exploration(epsilon)
                 try:
                     self.de.set_exploration(float(epsilon))
                 except Exception:
@@ -135,6 +143,7 @@ class ShadowRunner:
             except Exception:
                 pass
 
+        n = len(candles)
         start = max(int(lookback), 0)
         end = min(n - int(horizon), start + int(max_steps))
         if end <= start:
@@ -143,10 +152,7 @@ class ShadowRunner:
         for i in range(start, end):
             stats.steps += 1
             window = candles[i - lookback : i]
-            trade_features = {
-                "candles": window,
-                "step": i,
-            }
+            trade_features = {"candles": window, "step": i}
 
             try:
                 allow, score, risk_cfg = self.de.evaluate_trade(trade_features)
@@ -155,7 +161,6 @@ class ShadowRunner:
                 risk_cfg = risk_cfg or {}
                 forced = bool(risk_cfg.get("forced", False))
 
-                # ✅ regime-first tagging
                 regime = _regime_key(risk_cfg)
                 conf = _regime_conf(risk_cfg)
                 row = stats._rb_row(regime)
@@ -174,7 +179,6 @@ class ShadowRunner:
                     stats.deny += 1
                     row["deny"] += 1
 
-                # journal decision
                 if journal is not None:
                     try:
                         journal.log_decision(
@@ -205,14 +209,12 @@ class ShadowRunner:
                     stats.total_pnl += pnl
                     row["pnl"] += pnl
 
-                    # snapshot đầy đủ cho OutcomeUpdater học expert/regime/forced
                     snapshot = {
                         "step": i,
                         "features": trade_features,
                         "risk_cfg": risk_cfg,
                         "meta": (risk_cfg.get("meta", {}) or {}),
                     }
-
                     if self.outcome_updater is not None:
                         try:
                             self.outcome_updater.process_outcome(snapshot, outcome)
@@ -227,18 +229,13 @@ class ShadowRunner:
 
             except Exception as e:
                 stats.errors += 1
-
-                # try attribute-safe regime logging on error path
                 try:
-                    # if risk_cfg exists in locals
                     risk_cfg_local = locals().get("risk_cfg") or {}
                     regime = _regime_key(risk_cfg_local)
-                    row = stats._rb_row(regime)
-                    row["errors"] += 1
+                    stats._rb_row(regime)["errors"] += 1
                 except Exception:
                     pass
 
-                # debug: in 3 lỗi đầu tiên ra terminal cho dễ bắt gốc
                 if stats.errors <= 3:
                     print("[ShadowRunner] FIRST ERROR:", repr(e))
                     traceback.print_exc()

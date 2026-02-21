@@ -1,133 +1,93 @@
+# brain/experts/expert_base.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, Optional
 
 
-@dataclass(init=False)
+@dataclass
 class ExpertDecision:
     """
     Normalized decision object returned by experts / gate.
 
-    Backward compatible with older positional constructor:
-        ExpertDecision(allow, score, expert, meta)
-    New style:
-        ExpertDecision(expert="X", score=0.7, allow=True, action="hold", meta={...})
+    - allow: whether trade is allowed
+    - action: string action ("buy"/"sell"/"hold"/...)
+    - score: normalized score (higher is better)
+    - expert: expert name
+    - meta: extra info
     """
-
-    expert: str
-    score: float
-    allow: bool
-    action: str
-    meta: Dict[str, Any]
-
-    def __init__(
-        self,
-        *args: Any,
-        expert: Optional[str] = None,
-        score: float = 0.0,
-        allow: bool = False,
-        action: str = "hold",
-        meta: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> None:
-        # Support old positional: (allow, score, expert, meta)
-        if args:
-            # args[0]=allow, args[1]=score, args[2]=expert, args[3]=meta
-            if len(args) >= 1 and "allow" not in kwargs and allow is False:
-                allow = bool(args[0])
-            if len(args) >= 2 and "score" not in kwargs and score == 0.0:
-                try:
-                    score = float(args[1])
-                except Exception:
-                    score = 0.0
-            if len(args) >= 3 and expert is None:
-                expert = str(args[2])
-            if len(args) >= 4 and meta is None:
-                try:
-                    meta = dict(args[3]) if args[3] is not None else {}
-                except Exception:
-                    meta = {}
-
-        # Also allow passing expert/score/allow/action/meta via kwargs (compat)
-        if expert is None:
-            expert = str(kwargs.get("expert", "UNKNOWN"))
-
-        if meta is None:
-            meta = kwargs.get("meta") or {}
-        else:
-            # merge any extra keys into meta (optional)
-            pass
-
-        # merge extra keys into meta (optional)
-        extra = {k: v for k, v in kwargs.items() if k not in {"expert", "score", "allow", "action", "meta"}}
-        if extra:
-            meta = {**meta, **extra}
-
-        self.expert = str(expert)
-        self.score = float(score or 0.0)
-        self.allow = bool(allow)
-        self.action = str(action or "hold")
-        self.meta = dict(meta)
+    expert: str = "UNKNOWN"
+    score: float = 0.0
+    allow: bool = False
+    action: str = "hold"
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
-class BaseExpert(Protocol):
-    """Minimal interface for an Expert."""
+class ExpertBase:
+    """
+    Base class for all experts. Experts should implement decide(features, context).
+    """
+    name: str = "BASE"
 
-    name: str
-
-    def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Any: ...
-
-
-# Backward-compatible alias (some modules import ExpertBase)
-ExpertBase = BaseExpert
+    def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Any:
+        raise NotImplementedError
 
 
 def coerce_decision(raw: Any, fallback_expert: str = "UNKNOWN") -> Optional[ExpertDecision]:
-    """Convert arbitrary expert output -> ExpertDecision."""
+    """
+    Convert common raw outputs into ExpertDecision.
+
+    Supported:
+    - ExpertDecision: passthrough
+    - dict: {allow, score, action, meta, expert}
+    - tuple/list: (allow, score) or (allow, score, action) or (allow, score, action, meta)
+    - bool/float: treated as score (allow if score>0)
+    """
     if raw is None:
         return None
 
     if isinstance(raw, ExpertDecision):
+        if not raw.expert:
+            raw.expert = fallback_expert
         return raw
 
-    # dict payload
+    # dict output
     if isinstance(raw, dict):
-        expert = str(raw.get("expert", fallback_expert))
-        score = float(raw.get("score", 0.0) or 0.0)
+        expert = str(raw.get("expert") or fallback_expert)
+        try:
+            score = float(raw.get("score", 0.0))
+        except Exception:
+            score = 0.0
         allow = bool(raw.get("allow", score > 0))
-        action = str(raw.get("action", "hold") or "hold")
+        action = str(raw.get("action") or "hold")
         meta = raw.get("meta") or {}
-        extra = {k: v for k, v in raw.items() if k not in {"expert", "score", "allow", "action", "meta"}}
-        if extra:
-            meta = {**meta, **extra}
+        if not isinstance(meta, dict):
+            meta = {"meta": meta}
         return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=meta)
 
-    # tuple/list: (score, allow) or (score, allow, action)
-    if isinstance(raw, (tuple, list)) and len(raw) >= 2:
-        score = float(raw[0] or 0.0)
-        allow = bool(raw[1])
+    # tuple/list output
+    if isinstance(raw, (tuple, list)):
+        if len(raw) == 0:
+            return None
+        allow = bool(raw[0]) if len(raw) >= 1 else False
+        try:
+            score = float(raw[1]) if len(raw) >= 2 else 0.0
+        except Exception:
+            score = 0.0
         action = str(raw[2]) if len(raw) >= 3 and raw[2] is not None else "hold"
-        return ExpertDecision(expert=str(fallback_expert), score=score, allow=allow, action=action, meta={})
+        meta = raw[3] if len(raw) >= 4 else {}
+        if not isinstance(meta, dict):
+            meta = {"meta": meta}
+        return ExpertDecision(expert=fallback_expert, score=score, allow=allow, action=action, meta=meta)
 
-    # numeric score
+    # numeric => score
     if isinstance(raw, (int, float)):
         score = float(raw)
-        return ExpertDecision(expert=str(fallback_expert), score=score, allow=(score > 0), action="hold", meta={})
+        return ExpertDecision(expert=fallback_expert, score=score, allow=(score > 0), action="hold", meta={})
 
-    # unknown object -> attribute access
-    try:
-        score = float(getattr(raw, "score"))
-        allow = bool(getattr(raw, "allow", score > 0))
-        action = str(getattr(raw, "action", "hold"))
-        expert = str(getattr(raw, "expert", fallback_expert))
-        meta = getattr(raw, "meta", {}) or {}
-        return ExpertDecision(expert=expert, score=score, allow=allow, action=action, meta=dict(meta))
-    except Exception:
-        return ExpertDecision(
-            expert=str(fallback_expert),
-            score=0.0,
-            allow=False,
-            action="hold",
-            meta={"coerce_error": repr(raw)},
-        )
+    # bool => allow
+    if isinstance(raw, bool):
+        return ExpertDecision(expert=fallback_expert, score=1.0 if raw else 0.0, allow=raw, action="hold", meta={})
+
+    # unknown
+    return None
