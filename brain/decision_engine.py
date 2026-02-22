@@ -1,172 +1,252 @@
 # brain/decision_engine.py
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
+
+# -----------------------------
+# Optional imports (compat)
+# -----------------------------
 try:
-    from brain.experts.expert_gate import ExpertGate
+    from brain.experts.expert_gate import ExpertGate  # type: ignore
 except Exception:
     ExpertGate = None  # type: ignore
 
 try:
-    from brain.experts.expert_base import ExpertDecision
+    from brain.experts.expert_base import ExpertDecision  # type: ignore
 except Exception:
     ExpertDecision = None  # type: ignore
 
+try:
+    from brain.regime_detector import RegimeDetector  # type: ignore
+except Exception:
+    RegimeDetector = None  # type: ignore
 
+try:
+    # If you have a real registry class
+    from brain.experts.expert_registry import ExpertRegistry  # type: ignore
+except Exception:
+    ExpertRegistry = None  # type: ignore
+
+
+# -----------------------------
+# DecisionEngine
+# -----------------------------
 class DecisionEngine:
     """
-    DecisionEngine: glue layer between features -> regime -> expert_gate -> risk_cfg.
+    Core evaluator that:
+    - Builds expert registry + ExpertGate
+    - Detects regime
+    - Produces (allow, score, risk_cfg)
 
-    MUST remain compatible with:
-    - DecisionEngine(weight_store=..., risk_engine=..., debug=...)
-    - older code paths that pass risk_engine even if unused
+    IMPORTANT:
+    - Keep API stable
+    - Add compat blocks only
     """
 
     def __init__(
         self,
         weight_store: Optional[Any] = None,
         risk_engine: Optional[Any] = None,
+        regime_detector: Optional[Any] = None,
         debug: bool = False,
         **kwargs: Any,
-    ) -> None:
-        # Keep kwargs for compat (do not crash)
-        self._compat_kwargs = dict(kwargs)
+    ):
+        # ---- COMPAT BLOCK: accept legacy ctor args (do not remove) ----------
+        # tools/shadow_run.py or older callers may pass:
+        # - risk_engine=
+        # - learner=
+        # - reporter=
+        # - registry=
+        # - gate=
+        # We accept everything via **kwargs and map known fields.
+        self.debug = bool(debug or kwargs.get("dbg", False) or kwargs.get("verbose", False))
+        self.weight_store = weight_store or kwargs.get("weights") or kwargs.get("weightStore")
+        self.risk_engine = risk_engine or kwargs.get("risk") or kwargs.get("riskEngine")
+        # --------------------------------------------------------------------
 
-        self.weight_store = weight_store
-        self.risk_engine = risk_engine  # may be None, keep for compat
-        self.debug = bool(debug)
+        # Regime detector
+        if regime_detector is not None:
+            self.regime_detector = regime_detector
+        else:
+            # try build default
+            self.regime_detector = None
+            try:
+                if RegimeDetector is not None:
+                    self.regime_detector = RegimeDetector()
+            except Exception:
+                self.regime_detector = None
 
-        # Registry bootstrap:
-        self.registry = self._build_registry()
+        # Build registry + gate
+        self.registry = kwargs.get("registry") or None
+        if self.registry is None:
+            self.registry = self._build_registry()
 
         if ExpertGate is None:
             raise ImportError("ExpertGate is not available (brain.experts.expert_gate import failed).")
 
+        # Note: ExpertGate signature: (registry, weight_store=None, debug=False)
         self.gate = ExpertGate(self.registry, weight_store=self.weight_store, debug=self.debug)
 
-        # Lazy regime detector (optional)
-        self.regime_detector = None
-        try:
-            from brain.regime_detector import RegimeDetector
+        # exploration epsilon (optional)
+        self._epsilon: float = float(kwargs.get("epsilon", 0.0) or 0.0)
 
-            self.regime_detector = RegimeDetector(debug=self.debug)
-        except Exception:
-            self.regime_detector = None
-
+    # -----------------------------
+    # Registry builder (compat)
+    # -----------------------------
     def _build_registry(self) -> Any:
         """
-        Prefer ExpertRegistry if available; else fallback to DEFAULT_EXPERTS.
+        Prefer ExpertRegistry if exists, else fallback to DEFAULT_EXPERTS list wrapper.
         """
-        # Try ExpertRegistry if exists
-        try:
-            from brain.experts.expert_registry import ExpertRegistry  # type: ignore
+        # Prefer ExpertRegistry
+        if ExpertRegistry is not None:
+            try:
+                return ExpertRegistry()
+            except Exception:
+                pass
 
-            return ExpertRegistry()
-        except Exception:
-            pass
-
-        # Fallback: build a tiny registry wrapper around DEFAULT_EXPERTS
+        # Fallback: DEFAULT_EXPERTS
         try:
-            from brain.experts.experts_basic import DEFAULT_EXPERTS
+            from brain.experts.experts_basic import DEFAULT_EXPERTS  # type: ignore
 
             class _TmpRegistry:
                 def __init__(self, xs: Any):
-                    self._xs = list(xs)
+                    self._xs = xs
 
                 def get_all(self):
-                    return list(self._xs)
+                    return list(self._xs) if isinstance(self._xs, list) else []
 
             return _TmpRegistry(DEFAULT_EXPERTS)
         except Exception:
-            # Last resort empty registry (gate will baseline)
+            # last resort empty registry
             class _Empty:
                 def get_all(self):
                     return []
 
             return _Empty()
 
-    def _ensure_context(self, features: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Build context dict including regime/regime_conf if possible.
-        """
-        ctx: Dict[str, Any] = {}
+    # -----------------------------
+    # Optional exploration hook
+    # -----------------------------
+    def set_exploration(self, epsilon: float) -> None:
+        # COMPAT: ShadowRunner may call this
+        try:
+            self._epsilon = float(epsilon)
+        except Exception:
+            self._epsilon = 0.0
 
-        # If features already carry regime info, keep it
-        for k in ("regime", "market_regime", "state"):
-            if k in features and features.get(k) is not None:
-                ctx["regime"] = features.get(k)
-                break
-
-        # Detect regime from features (preferred) or candles (compat)
-        if ctx.get("regime") is None and self.regime_detector is not None:
-                # New style: detector can read features dict
+    # -----------------------------
+    # Regime detection (compat)
+    # -----------------------------
+    def _detect_regime(self, features: Dict[str, Any]) -> Tuple[str, float]:
+        """
+        Returns (regime_key, regime_conf).
+        Tries:
+        - regime already in features
+        - regime_detector.detect(features)
+        - regime_detector.detect(candles) legacy
+        """
+        # If already provided by upstream, keep it
+        r = features.get("market_regime") or features.get("regime") or features.get("state")
+        if r:
             try:
-                out = self.regime_detector.detect(features)
-
-                # ===== NEW COMPAT BLOCK =====
-                # Support tuple return (regime, confidence)
-                if isinstance(out, tuple) and len(out) >= 2:
-                    ctx["regime"] = out[0]
-                    ctx["regime_conf"] = float(out[1])
-                elif isinstance(out, dict):
-                    ctx["regime"] = (
-                        out.get("regime")
-                        or out.get("market_regime")
-                        or out.get("state")
-                    )
-                    if "confidence" in out:
-                        ctx["regime_conf"] = out["confidence"]
-                    elif "regime_conf" in out:
-                        ctx["regime_conf"] = out["regime_conf"]
+                conf = float(features.get("regime_conf") or features.get("confidence") or 0.0)
             except Exception:
-                pass
+                conf = 0.0
+            return str(r), conf
 
-        # Hard fallback
-        if ctx.get("regime") is None:
-            ctx["regime"] = "unknown"
+        det = getattr(self, "regime_detector", None)
+        if det is None:
+            return "unknown", 0.0
 
-        return ctx
+        # New style: detect from features
+        try:
+            if hasattr(det, "detect"):
+                out = det.detect(features)  # could be str or tuple or dict
+                if isinstance(out, tuple) and len(out) >= 2:
+                    return str(out[0]), float(out[1] or 0.0)
+                if isinstance(out, dict):
+                    rr = out.get("regime") or out.get("market_regime") or out.get("state") or "unknown"
+                    cc = out.get("regime_conf") or out.get("confidence") or 0.0
+                    return str(rr), float(cc or 0.0)
+                if isinstance(out, str):
+                    return out, 0.0
+        except Exception:
+            pass
 
+        # Legacy: detect from candles/window
+        try:
+            candles = features.get("candles")
+            if candles is not None and hasattr(det, "detect"):
+                out = det.detect(candles)
+                if isinstance(out, tuple) and len(out) >= 2:
+                    return str(out[0]), float(out[1] or 0.0)
+                if isinstance(out, str):
+                    return out, 0.0
+        except Exception:
+            pass
+
+        return "unknown", 0.0
+
+    # -----------------------------
+    # Main API: evaluate_trade
+    # -----------------------------
     def evaluate_trade(self, features: Dict[str, Any]) -> Tuple[bool, float, Dict[str, Any]]:
         """
-        Returns (allow, score, risk_cfg).
+        Returns:
+          allow: bool
+          score: float
+          risk_cfg: dict
 
-        risk_cfg schema remains dict and will carry:
-        - regime, regime_conf
-        - expert
-        - meta (optional)
+        MUST stay stable.
         """
-        if ExpertDecision is None:
-            # ultra-fallback
-            allow, score, risk_cfg = True, 0.0, {"regime": "unknown", "expert": "UNKNOWN"}
-            return allow, score, risk_cfg
+        if not isinstance(features, dict):
+            features = {}
 
-        context = self._ensure_context(features)
+        # Detect regime and inject to features for ExpertGate weight key
+        regime, regime_conf = self._detect_regime(features)
+        features.setdefault("market_regime", regime)
+        features.setdefault("regime", regime)
+        features.setdefault("regime_conf", regime_conf)
+
+        # Gate call (compat)
+        allow: bool = False
+        score: float = 0.0
+        risk_cfg: Dict[str, Any] = {}
 
         try:
-            best = self.gate.evaluate_trade(features, context=context)
+            # Newer gate API: decide() returns GateOutput dataclass
+            if hasattr(self.gate, "decide"):
+                out = self.gate.decide(features)
+                allow = bool(getattr(out, "allow", False))
+                score = float(getattr(out, "score", 0.0) or 0.0)
+                rc = getattr(out, "risk_cfg", None)
+                if isinstance(rc, dict):
+                    risk_cfg = dict(rc)
+                else:
+                    risk_cfg = {}
+                # also attach expert/meta if available
+                risk_cfg.setdefault("regime", regime)
+                risk_cfg.setdefault("regime_conf", regime_conf)
+                return allow, score, risk_cfg
+
+            # Older gate API: evaluate() returns (allow, score, risk_cfg)
+            if hasattr(self.gate, "evaluate"):
+                a, s, rc = self.gate.evaluate(features)
+                allow = bool(a)
+                score = float(s or 0.0)
+                if isinstance(rc, dict):
+                    risk_cfg = dict(rc)
+                risk_cfg.setdefault("regime", regime)
+                risk_cfg.setdefault("regime_conf", regime_conf)
+                return allow, score, risk_cfg
+
         except Exception:
-            # Compat: gate might expose evaluate() or decide()
-            try:
-                best = self.gate.evaluate(features, context=context)  # type: ignore
-            except Exception:
-                best = ExpertDecision(expert="UNKNOWN", allow=False, score=0.0, action="hold", meta={"reason": "gate_failed"})
+            # fallthrough to safe fallback
+            pass
 
-        # Normalize
-        allow = bool(getattr(best, "allow", False))
-        score = float(getattr(best, "score", 0.0) or 0.0)
-
-        # risk_cfg schema (stable)
-        risk_cfg: Dict[str, Any] = {}
-        risk_cfg["regime"] = context.get("regime", "unknown")
-        if "regime_conf" in context:
-            risk_cfg["regime_conf"] = context["regime_conf"]
-        risk_cfg["expert"] = getattr(best, "expert", "UNKNOWN")
-
-        # Keep meta, but don't explode schema
-        meta = getattr(best, "meta", None)
-        if isinstance(meta, dict) and meta:
-            risk_cfg["meta"] = meta
-
+        # Hard fallback: never crash the pipeline
+        risk_cfg.setdefault("regime", regime)
+        risk_cfg.setdefault("regime_conf", regime_conf)
         return allow, score, risk_cfg

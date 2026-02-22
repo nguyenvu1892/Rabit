@@ -1,267 +1,244 @@
-# brain/decision_engine.py
+# brain/regime_detector.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Tuple
+import math
 
 
-# --- Optional imports (keep compat; do NOT hard crash on missing) ---
-try:
-    from brain.experts.expert_gate import ExpertGate  # type: ignore
-except Exception:
-    ExpertGate = None  # type: ignore
-
-try:
-    from brain.experts.expert_registry import ExpertRegistry  # type: ignore
-except Exception:
-    ExpertRegistry = None  # type: ignore
-
-try:
-    from brain.experts.experts_basic import DEFAULT_EXPERTS  # type: ignore
-except Exception:
-    DEFAULT_EXPERTS = None  # type: ignore
-
-try:
-    from brain.experts.expert_base import ExpertDecision  # type: ignore
-except Exception:
-    ExpertDecision = None  # type: ignore
-
-try:
-    from brain.regime_detector import RegimeDetector  # type: ignore
-except Exception:
-    RegimeDetector = None  # type: ignore
+@dataclass(frozen=True)
+class RegimeResult:
+    regime: str
+    vol: float
+    slope: float
+    confidence: float
 
 
-def _as_dict(x: Any) -> Dict[str, Any]:
-    return x if isinstance(x, dict) else {}
-
-
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        v = float(x)
-        if v != v:  # NaN
-            return default
-        if v == float("inf") or v == float("-inf"):
-            return default
-        return v
-    except Exception:
-        return default
-
-
-def _ensure_risk_cfg(risk_cfg: Any) -> Dict[str, Any]:
-    if isinstance(risk_cfg, dict):
-        return risk_cfg
-    return {}
-
-
-def _inject_regime_into_risk_cfg(
-    risk_cfg: Dict[str, Any],
-    regime: str,
-    regime_conf: float,
-) -> Dict[str, Any]:
-    # keep schema stable; only inject if absent or empty
-    if not isinstance(risk_cfg, dict):
-        risk_cfg = {}
-    if not risk_cfg.get("regime"):
-        risk_cfg["regime"] = str(regime) if regime is not None else "unknown"
-    if "regime_conf" not in risk_cfg:
-        risk_cfg["regime_conf"] = _safe_float(regime_conf, 0.0)
-    return risk_cfg
-
-
-def _regime_from_features(features: Dict[str, Any], debug: bool = False) -> Tuple[str, float]:
-    """
-    NEW (5.1.9): detect regime from FeaturePack features first.
-    Fallback to RegimeDetector.detect if available.
-    """
-    # Prefer FeaturePackV1 signals if present
-    slope_n = _safe_float(features.get("slope_n"), 0.0)
-    ret_std = _safe_float(features.get("ret_std"), 0.0)
-    atr_n = _safe_float(features.get("atr_n"), 0.0)
-    ok = bool(features.get("fpv1_ok"))
-
-    # simple, stable thresholds (tune later; keep deterministic)
-    # slope_n typical magnitude is small; use conservative threshold
-    thr_trend = 0.0006
-    thr_range_vol = 0.0012  # if vol very low -> likely range
-
-    if ok and (("slope_n" in features) or ("ret_std" in features) or ("atr_n" in features)):
-        if slope_n > thr_trend:
-            regime = "trend_up"
-            conf = min(1.0, abs(slope_n) / max(1e-9, thr_trend))
-        elif slope_n < -thr_trend:
-            regime = "trend_down"
-            conf = min(1.0, abs(slope_n) / max(1e-9, thr_trend))
-        else:
-            regime = "range"
-            # confidence: lower vol => higher confidence for range
-            vol_proxy = abs(ret_std) + abs(atr_n)
-            conf = 1.0 - min(1.0, vol_proxy / max(1e-9, thr_range_vol))
-
-        if debug:
-            print(f"[DecisionEngine] regime_from_features slope_n={slope_n:.6g} ret_std={ret_std:.6g} atr_n={atr_n:.6g} -> {regime} (conf={conf:.3f})")
-        return regime, conf
-
-    # Fallback: use RegimeDetector if available (keeps old behavior)
-    if RegimeDetector is not None:
-        try:
-            rd = RegimeDetector(debug=debug)  # type: ignore
-            # Support both APIs: detect(features) or detect(candles)
-            if hasattr(rd, "detect"):
-                try:
-                    out = rd.detect(features)  # type: ignore
-                except Exception:
-                    candles = features.get("candles")
-                    out = rd.detect(candles)  # type: ignore
-                # out can be (regime, conf) or dict-like
-                if isinstance(out, tuple) and len(out) >= 2:
-                    return str(out[0]), _safe_float(out[1], 0.0)
-                if isinstance(out, dict):
-                    return str(out.get("regime", "unknown")), _safe_float(out.get("confidence", out.get("regime_conf", 0.0)), 0.0)
-        except Exception:
-            pass
-
-    return "unknown", 0.0
-
-
-class DecisionEngine:
-    """
-    DecisionEngine (5.1.x -> 5.1.9):
-    - Keeps evaluate_trade API: returns (allow: bool, score: float, risk_cfg: dict)
-    - Adds compat blocks; DOES NOT delete old logic paths
-    - NEW: inject regime/regime_conf into risk_cfg using features (FeaturePack)
-    """
-
+class RegimeDetector:
     def __init__(
         self,
-        weight_store: Optional[Any] = None,
-        risk_engine: Optional[Any] = None,
+        *,
         debug: bool = False,
-        **kwargs: Any,  # COMPAT: accept unexpected kwargs (e.g., older tools passing risk_engine)
-    ):
+        window: int = 32,
+        min_slope_th: float = 0.0010,
+        min_vol_th: float = 0.0015,
+    ) -> None:
         self.debug = bool(debug)
+        self.window = int(window) if window and window > 2 else 32
+        self.min_slope_th = float(min_slope_th)
+        self.min_vol_th = float(min_vol_th)
 
-        # COMPAT: allow passing risk_engine by kwargs too
-        if risk_engine is None and "risk_engine" in kwargs:
-            risk_engine = kwargs.get("risk_engine")
-
-        self.risk_engine = risk_engine
-        self.weight_store = weight_store
-
-        self._epsilon: float = 0.0
-
-        # build registry + gate (compat; do not hard fail)
-        self.registry = self._build_registry()
-        if ExpertGate is None:
-            raise ImportError("ExpertGate is not available (brain.experts.expert_gate import failed).")
-
-        # keep same constructor style as previous iterations
-        try:
-            self.gate = ExpertGate(self.registry, weight_store=self.weight_store, debug=self.debug)  # type: ignore
-        except TypeError:
-            # COMPAT: older ExpertGate signature without weight_store
-            self.gate = ExpertGate(self.registry, debug=self.debug)  # type: ignore
-
-    # --- compat: keep method for shadow_runner ---
-    def set_exploration(self, epsilon: float) -> None:
-        self._epsilon = _safe_float(epsilon, 0.0)
-
-    def _build_registry(self) -> Any:
-        """
-        Prefer ExpertRegistry if available; else fall back to DEFAULT_EXPERTS.
-        This preserves prior behavior and avoids circular import crashes.
-        """
-        if ExpertRegistry is not None:
+    def _dprint(self, *args: Any) -> None:
+        if self.debug:
             try:
-                return ExpertRegistry()  # type: ignore
+                print(*args)
             except Exception:
                 pass
 
-        # fallback to DEFAULT_EXPERTS list
-        if DEFAULT_EXPERTS is not None:
-            try:
-                xs = list(DEFAULT_EXPERTS)
-            except Exception:
-                xs = []
-
-            class _TmpRegistry:
-                def __init__(self, items: Any):
-                    self._items = items
-
-                def get_all(self) -> Any:
-                    return list(self._items)
-
-            return _TmpRegistry(xs)
-
-        # last resort empty registry
-        class _Empty:
-            def get_all(self) -> Any:
-                return []
-
-        return _Empty()
-
-    def evaluate_trade(self, features: Any) -> Tuple[bool, float, Dict[str, Any]]:
-        """
-        Return (allow, score, risk_cfg)
-        """
-        feats = _as_dict(features)
-
-        # NEW (5.1.9): detect regime from features (FeaturePack), then inject into risk_cfg
-        regime, regime_conf = _regime_from_features(feats, debug=self.debug)
-
-        # Legacy/compat: call ExpertGate in the safest way
+    # ==============================
+    # FIX: parse tab-separated candle
+    # ==============================
+    def _extract_closes(self, candles: Any) -> List[float]:
+        closes: List[float] = []
+        if candles is None:
+            return closes
         try:
-            gate_eval = getattr(self.gate, "evaluate", None)
-            gate_decide = getattr(self.gate, "decide", None)
+            for c in candles:
+                # case 1: dict with tab-separated string value
+                if isinstance(c, dict) and len(c) == 1:
+                    raw = list(c.values())[0]
+                    if isinstance(raw, str):
+                        parts = raw.split("\t")
+                        if len(parts) >= 6:
+                            closes.append(float(parts[5]))
+                            continue
 
-            if callable(gate_eval):
-                out = gate_eval(feats)
-            elif callable(gate_decide):
-                out = gate_decide(feats)
-            else:
-                # If gate is miswired, fail closed but keep schema stable
-                return False, 0.0, _inject_regime_into_risk_cfg({}, regime, regime_conf)
+                # case 2: dict normal OHLC
+                if isinstance(c, dict):
+                    for k in ("close", "c", "Close", "CLOSE"):
+                        if k in c:
+                            closes.append(float(c[k]))
+                            break
+                    continue
 
-            # Normalize output shapes:
-            # - could be ExpertDecision
-            # - could be tuple (allow, score, risk_cfg)
-            # - could be tuple (allow, score, risk_cfg, expert, meta)
-            allow: bool = False
-            score: float = 0.0
-            risk_cfg: Dict[str, Any] = {}
+                # case 3: list/tuple OHLC
+                if isinstance(c, (list, tuple)):
+                    if len(c) >= 5:
+                        closes.append(float(c[4]))
+                    elif len(c) >= 4:
+                        closes.append(float(c[3]))
+                    continue
+        except Exception:
+            return closes
+        return closes
 
-            if ExpertDecision is not None and isinstance(out, ExpertDecision):  # type: ignore
-                allow = bool(getattr(out, "allow", False))
-                score = _safe_float(getattr(out, "score", 0.0), 0.0)
+    def _compute_slope_vol(self, closes: List[float]) -> Tuple[float, float]:
+        n = len(closes)
+        if n < 3:
+            return 0.0, 0.0
+        w = closes[-self.window :] if n > self.window else closes
+        if len(w) < 3:
+            return 0.0, 0.0
 
-                # COMPAT: some versions store risk config in .risk_cfg, some in .meta
-                rc = getattr(out, "risk_cfg", None)
-                if isinstance(rc, dict):
-                    risk_cfg = rc
-                else:
-                    meta = getattr(out, "meta", None)
-                    if isinstance(meta, dict) and isinstance(meta.get("risk_cfg"), dict):
-                        risk_cfg = meta["risk_cfg"]
-                    else:
-                        risk_cfg = {}
+        first = w[0]
+        last = w[-1]
+        denom = abs(first) if abs(first) > 1e-9 else 1.0
+        slope = (last - first) / denom
 
-                risk_cfg = _inject_regime_into_risk_cfg(risk_cfg, regime, regime_conf)
-                return allow, score, risk_cfg
+        rets: List[float] = []
+        for i in range(1, len(w)):
+            prev = w[i - 1]
+            cur = w[i]
+            d = abs(prev) if abs(prev) > 1e-9 else 1.0
+            rets.append((cur - prev) / d)
 
-            if isinstance(out, tuple):
-                if len(out) >= 3:
-                    allow = bool(out[0])
-                    score = _safe_float(out[1], 0.0)
-                    risk_cfg = _ensure_risk_cfg(out[2])
-                    risk_cfg = _inject_regime_into_risk_cfg(risk_cfg, regime, regime_conf)
-                    return allow, score, risk_cfg
+        if not rets:
+            return float(slope), 0.0
+        vol = sum(abs(r) for r in rets) / len(rets)
+        return float(slope), float(vol)
 
-            # Unknown output -> safe fallback
-            return False, 0.0, _inject_regime_into_risk_cfg({}, regime, regime_conf)
+    def _sigmoid(self, x: float) -> float:
+        try:
+            return 1.0 / (1.0 + math.exp(-x))
+        except Exception:
+            return 0.5
 
-        except Exception as e:
-            if self.debug:
-                print(f"[DecisionEngine] evaluate_trade error: {e}")
-            return False, 0.0, _inject_regime_into_risk_cfg({}, regime, regime_conf)
+    def _clamp(self, x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    # ==========================================================
+    # COMPAT ADD: detect from precomputed features (FeaturePack)
+    # - DO NOT remove old candle-based behavior
+    # - If slope/vol already exist in features, use them
+    # - Else try series keys (closes/close_series/etc)
+    # - Else fallback to candles extraction (old logic)
+    # ==========================================================
+    def _pick_first_float(self, features: Dict[str, Any], keys: List[str]) -> float | None:
+        for k in keys:
+            if k in features:
+                v = features.get(k)
+                try:
+                    if v is None:
+                        continue
+                    # allow dict wrapper
+                    if isinstance(v, dict):
+                        # common: {"value": x}
+                        for kk in ("value", "v"):
+                            if kk in v:
+                                v = v[kk]
+                                break
+                    return float(v)
+                except Exception:
+                    continue
+        return None
+
+    def _extract_series_from_features(self, features: Dict[str, Any]) -> List[float]:
+        # common series keys from feature packs
+        for k in (
+            "closes",
+            "close_series",
+            "close_list",
+            "prices",
+            "price_series",
+            "series_close",
+            "close",
+        ):
+            if k in features:
+                v = features.get(k)
+                # if single float, ignore
+                if isinstance(v, (int, float)):
+                    continue
+                if isinstance(v, (list, tuple)):
+                    out: List[float] = []
+                    for x in v:
+                        try:
+                            out.append(float(x))
+                        except Exception:
+                            pass
+                    if len(out) >= 3:
+                        return out
+        return []
+
+    def detect(self, features: Dict[str, Any]) -> RegimeResult:
+        if not isinstance(features, dict):
+            return RegimeResult("unknown", 0.0, 0.0, 0.0)
+
+        # ---------- COMPAT PATH 1: use precomputed slope/vol if available ----------
+        # keep it generous because pack naming may vary
+        slope = self._pick_first_float(
+            features,
+            keys=[
+                "slope",
+                "trend_slope",
+                "ema_slope",
+                "price_slope",
+                "ret_slope",
+                "linreg_slope",
+            ],
+        )
+        vol = self._pick_first_float(
+            features,
+            keys=[
+                "vol",
+                "volatility",
+                "ret_vol",
+                "return_vol",
+                "atr",
+                "natr",
+                "std",
+                "std_ret",
+                "range_vol",
+            ],
+        )
+
+        if slope is None or vol is None:
+            # ---------- COMPAT PATH 2: compute from series keys if present ----------
+            closes_series = self._extract_series_from_features(features)
+            if closes_series:
+                s2, v2 = self._compute_slope_vol(closes_series)
+                slope = s2 if slope is None else slope
+                vol = v2 if vol is None else vol
+
+        if slope is None or vol is None:
+            # ---------- OLD PATH: fallback to candles (DO NOT REMOVE) ----------
+            candles = features.get("candles")
+            closes = self._extract_closes(candles)
+            s3, v3 = self._compute_slope_vol(closes)
+            slope = s3 if slope is None else slope
+            vol = v3 if vol is None else vol
+
+        # still None? hard fallback
+        if slope is None:
+            slope = 0.0
+        if vol is None:
+            vol = 0.0
+
+        abs_vol = abs(vol)
+        abs_slope = abs(slope)
+
+        slope_th = max(self.min_slope_th, 2.6 * abs_vol)
+        vol_th = max(self.min_vol_th, 2.2 * abs_vol + self.min_vol_th * 0.5)
+
+        if abs_slope > slope_th:
+            regime = "trend_up" if slope > 0 else "trend_down"
+        else:
+            regime = "volatile" if abs_vol > vol_th else "range"
+
+        rel_trend = abs_slope / (slope_th + 1e-12)
+        rel_vol = abs_vol / (vol_th + 1e-12)
+
+        trend_conf = self._sigmoid(2.0 * (rel_trend - 1.0))
+        vol_conf = self._sigmoid(2.0 * (rel_vol - 1.0))
+
+        confidence = 0.52
+        if regime.startswith("trend_"):
+            confidence += 0.28 * trend_conf + 0.10 * vol_conf
+        elif regime == "volatile":
+            confidence += 0.25 * vol_conf + 0.05 * (1.0 - trend_conf)
+        else:
+            confidence += 0.18 * (1.0 - trend_conf) + 0.08 * (1.0 - vol_conf)
+
+        confidence = self._clamp(confidence, 0.20, 0.99)
+
+        self._dprint("REGIME DEBUG | slope=", slope, "vol=", vol, "=>", regime)
+        return RegimeResult(regime, float(vol), float(slope), float(confidence))

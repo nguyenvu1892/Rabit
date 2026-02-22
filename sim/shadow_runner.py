@@ -6,10 +6,7 @@ from typing import Any, Dict, Optional
 import random
 import traceback
 
-
-# =========================
-# COMPAT: FeaturePackV1 (optional)
-# =========================
+# NEW: FeaturePackV1 injection (compat-safe)
 try:
     from brain.features.feature_pack_v1 import FeaturePackV1  # type: ignore
 except Exception:
@@ -17,7 +14,6 @@ except Exception:
 
 
 def _regime_key(risk_cfg: Dict[str, Any]) -> str:
-    """Best-effort regime key extraction (compat across versions)."""
     if not isinstance(risk_cfg, dict):
         return "unknown"
     r = risk_cfg.get("regime") or risk_cfg.get("market_regime") or risk_cfg.get("state")
@@ -25,7 +21,6 @@ def _regime_key(risk_cfg: Dict[str, Any]) -> str:
 
 
 def _regime_conf(risk_cfg: Dict[str, Any]) -> float:
-    """Best-effort regime confidence extraction (compat across versions)."""
     if not isinstance(risk_cfg, dict):
         return 0.0
     c = risk_cfg.get("regime_conf") or risk_cfg.get("confidence") or 0.0
@@ -47,8 +42,6 @@ class ShadowStats:
     losses: int = 0
     total_pnl: float = 0.0
     forced_entries: int = 0
-
-    # per-regime aggregation (schema used by tools/shadow_run.py prints)
     regime_breakdown: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def _rb_row(self, regime: str) -> Dict[str, Any]:
@@ -88,19 +81,11 @@ class ShadowStats:
 
 class ShadowRunner:
     """
-    Compat-first ShadowRunner.
-
-    Goals:
-    - DO NOT break old call sites.
-    - Accept extra kwargs (risk_engine, journal, debug...) safely.
-    - Keep the original evaluate loop + stats schema.
-
-    Supported call patterns:
-      runner = ShadowRunner(decision_engine=de, risk_engine=..., outcome_updater=..., train=..., debug=...)
-      stats  = runner.run(candles, lookback=..., max_steps=..., horizon=..., train=..., epsilon=..., epsilon_cooldown=..., journal=...)
-      stats  = runner.run(candles=..., ...)
-      stats  = runner.run(rows=..., ...)
-      stats  = runner.run(data=..., ...)
+    Compat-first ShadowRunner:
+    - __init__ accepts risk_engine (optional) to avoid 'unexpected keyword'
+    - run() accepts candles in many forms:
+        run(candles, ...) OR run(candles=...) OR run(rows=...) OR run(data=...)
+    - run() accepts journal kw (and ignores unknown kwargs safely)
     """
 
     def __init__(
@@ -113,32 +98,86 @@ class ShadowRunner:
         debug: bool = False,
         **kwargs,
     ) -> None:
-        # -------------------------
-        # COMPAT: accept both "decision_engine" and legacy "de" via kwargs
-        # -------------------------
-        if decision_engine is None:
-            decision_engine = kwargs.get("de") or kwargs.get("engine")
+        # ---- COMPAT: accept different ctor param names (without breaking old code) ----
+        # tools/shadow_run may pass decision_engine=...
+        if decision_engine is None and "de" in kwargs:
+            decision_engine = kwargs.get("de")
+        if decision_engine is None and "engine" in kwargs:
+            decision_engine = kwargs.get("engine")
 
+        # keep legacy field name used by existing code
+        self.de = decision_engine
+        # extra alias for safety (some code may reference these)
         self.decision_engine = decision_engine
-        self.de = decision_engine  # alias (some code expects self.de)
+        self.engine = decision_engine
 
-        self.risk_engine = risk_engine  # kept for forward-compat; may be unused here
+        self.risk_engine = risk_engine
         self.outcome_updater = outcome_updater
-
         self.train = bool(train)
-        self.debug = bool(debug)  # some error handlers check self.debug
-
+        self.debug = bool(debug)  # <-- fix "no attribute debug"
         self.rng = random.Random(seed)
 
-    # -------------------------
-    # Core sim outcome (kept simple + deterministic-ish)
-    # -------------------------
+        # stash any extra compat kwargs (do not crash)
+        self._compat_kwargs = dict(kwargs)
+
     def simulate_outcome(self, score: float) -> Dict[str, Any]:
-        # Higher score -> higher win chance
+        # simple sim: higher score -> higher win chance
         p_win = max(0.05, min(0.95, 0.5 + 0.4 * (score - 0.5)))
         win = self.rng.random() < p_win
         pnl = self.rng.uniform(0.2, 1.2) if win else -self.rng.uniform(0.2, 1.2)
         return {"win": win, "pnl": pnl}
+
+    # -------------------------------------------------------------------------
+    # COMPAT ADD: inject regime into risk_cfg if missing (fix UNKNOWN breakdown)
+    # Priority:
+    # 1) decision_engine.regime_detector.detect(features) if exists
+    # 2) features['regime'] / features['regime_conf'] if present
+    # -------------------------------------------------------------------------
+    def _ensure_regime_in_risk_cfg(self, trade_features: Dict[str, Any], risk_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(risk_cfg, dict):
+            risk_cfg = {}
+
+        # if already set -> do nothing
+        if (risk_cfg.get("regime") is not None) and (risk_cfg.get("regime") != ""):
+            return risk_cfg
+
+        # try DecisionEngine.regime_detector
+        try:
+            rd = getattr(self.de, "regime_detector", None)
+            if rd is not None and hasattr(rd, "detect"):
+                rr = rd.detect(trade_features)
+                # rr could be dataclass or dict-like
+                regime = getattr(rr, "regime", None) if rr is not None else None
+                conf = getattr(rr, "confidence", None) if rr is not None else None
+                if regime:
+                    risk_cfg["regime"] = str(regime)
+                if conf is not None:
+                    try:
+                        risk_cfg["regime_conf"] = float(conf)
+                    except Exception:
+                        pass
+                return risk_cfg
+        except Exception:
+            pass
+
+        # fallback: from trade_features (if feature pack provided)
+        try:
+            if "regime" in trade_features and trade_features.get("regime") is not None:
+                risk_cfg["regime"] = str(trade_features.get("regime"))
+            if "regime_conf" in trade_features and trade_features.get("regime_conf") is not None:
+                try:
+                    risk_cfg["regime_conf"] = float(trade_features.get("regime_conf"))
+                except Exception:
+                    pass
+            elif "confidence" in trade_features and trade_features.get("confidence") is not None:
+                try:
+                    risk_cfg["regime_conf"] = float(trade_features.get("confidence"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return risk_cfg
 
     def run(
         self,
@@ -155,17 +194,7 @@ class ShadowRunner:
         journal=None,
         **kwargs,
     ) -> ShadowStats:
-        """
-        Main loop.
-
-        IMPORTANT compat behavior:
-        - accepts journal kwarg (tools/shadow_run passes it)
-        - accepts arbitrary **kwargs to avoid 'unexpected keyword' explosions
-        """
-
-        # -------------------------
-        # COMPAT: input selection
-        # -------------------------
+        # compat input selection
         if candles is None:
             candles = rows if rows is not None else data
 
@@ -173,23 +202,15 @@ class ShadowRunner:
         if candles is None:
             return stats
 
-        de = self.de or self.decision_engine
-        if de is None:
-            # No decision engine => can't evaluate anything
-            return stats
-
         train_mode = self.train if train is None else bool(train)
 
-        # -------------------------
-        # COMPAT: push exploration if supported
-        # -------------------------
-        if hasattr(de, "set_exploration"):
+        # push exploration config into decision engine (if supported)
+        if hasattr(self.de, "set_exploration"):
             try:
-                de.set_exploration(epsilon=float(epsilon), cooldown=int(epsilon_cooldown))
+                self.de.set_exploration(epsilon=float(epsilon), cooldown=int(epsilon_cooldown))
             except TypeError:
-                # older signature: set_exploration(float)
                 try:
-                    de.set_exploration(float(epsilon))
+                    self.de.set_exploration(float(epsilon))
                 except Exception:
                     pass
             except Exception:
@@ -201,38 +222,31 @@ class ShadowRunner:
         if end <= start:
             return stats
 
-        # -------------------------
-        # Core evaluation loop (kept)
-        # -------------------------
         for i in range(start, end):
             stats.steps += 1
+            window = candles[i - lookback : i]
+            trade_features = {"candles": window, "step": i}
+
+            # ===== FeaturePack injection (DO NOT break old schema) =====
+            if FeaturePackV1 is not None and "candles" in trade_features:
+                try:
+                    trade_features.update(FeaturePackV1.compute(trade_features["candles"]))
+                except Exception:
+                    pass
 
             try:
-                window = candles[i - lookback : i]
-
-                # Keep schema: candles + step
-                trade_features: Dict[str, Any] = {"candles": window, "step": i}
-
-                # -------------------------
-                # COMPAT: FeaturePack injection (non-breaking)
-                # -------------------------
-                if FeaturePackV1 is not None and "candles" in trade_features:
-                    try:
-                        trade_features.update(FeaturePackV1.compute(trade_features["candles"]))
-                    except Exception:
-                        pass
-
-                # DecisionEngine API (current): allow, score, risk_cfg
-                allow, score, risk_cfg = de.evaluate_trade(trade_features)
+                allow, score, risk_cfg = self.de.evaluate_trade(trade_features)
                 stats.decisions += 1
 
                 risk_cfg = risk_cfg or {}
-                forced = bool(risk_cfg.get("forced", False))
+                # ---- COMPAT: fix UNKNOWN by injecting regime if missing ----
+                risk_cfg = self._ensure_regime_in_risk_cfg(trade_features, risk_cfg)
 
+                forced = bool(risk_cfg.get("forced", False))
                 regime = _regime_key(risk_cfg)
                 conf = _regime_conf(risk_cfg)
-                row = stats._rb_row(regime)
 
+                row = stats._rb_row(regime)
                 row["decisions"] += 1
                 if conf > 0:
                     row["conf_sum"] += float(conf)
@@ -248,7 +262,6 @@ class ShadowRunner:
                     stats.deny += 1
                     row["deny"] += 1
 
-                # journal decision (optional)
                 if journal is not None:
                     try:
                         journal.log_decision(
@@ -262,10 +275,9 @@ class ShadowRunner:
                     except Exception:
                         pass
 
-                # training outcome only on allowed trades
+                # training outcome
                 if train_mode and bool(allow):
                     outcome = self.simulate_outcome(float(score))
-
                     stats.outcomes += 1
                     row["outcomes"] += 1
 
@@ -287,18 +299,12 @@ class ShadowRunner:
                         "meta": (risk_cfg.get("meta", {}) or {}),
                     }
 
-                    # outcome updater hook (optional)
                     if self.outcome_updater is not None:
                         try:
-                            # prefer process_outcome if present
-                            if hasattr(self.outcome_updater, "process_outcome"):
-                                self.outcome_updater.process_outcome(snapshot, outcome)
-                            elif hasattr(self.outcome_updater, "on_outcome"):
-                                self.outcome_updater.on_outcome(snapshot, outcome)
+                            self.outcome_updater.process_outcome(snapshot, outcome)
                         except Exception:
                             pass
 
-                    # journal outcome (optional)
                     if journal is not None:
                         try:
                             journal.log_outcome(step=i, outcome=outcome)
@@ -314,7 +320,6 @@ class ShadowRunner:
                 except Exception:
                     pass
 
-                # Print only first few errors to keep console readable
                 if stats.errors <= 3:
                     print("[ShadowRunner] FIRST ERROR:", repr(e))
                     traceback.print_exc()
