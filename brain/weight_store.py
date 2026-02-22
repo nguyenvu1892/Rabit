@@ -1,117 +1,153 @@
 # brain/weight_store.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
 import json
 import os
 import time
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+
+def _now_ts() -> float:
+    return time.time()
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
 @dataclass
 class WeightMeta:
-    created_at: float = 0.0
-    updated_at: float = 0.0
+    created_at: float
+    updated_at: float
     version: str = "5.1.9"
 
 
 class WeightStore:
     """
     Schema (KEEP):
-    {
-      "session": {...},
-      "pattern": {...},
-      "structure": {...},
-      "trend": {...},
-      "expert_regime": {...},
-      "meta": {...}
-    }
+      {
+        "session": {...},
+        "pattern": {...},
+        "structure": {...},
+        "trend": {...},
+        "expert_regime": {
+            "EXPERT|regime": weight,
+            ...
+        },
+        "meta": { "created_at":..., "updated_at":..., "version":"..." }
+      }
+
+    Compat goals:
+    - keep old buckets (session/pattern/structure/trend)
+    - add stable expert_regime operations
+    - accept legacy keys / signatures without breaking
     """
 
-    def __init__(self, data: Optional[Dict[str, Any]] = None) -> None:
-        self.data: Dict[str, Any] = data or {}
-        self._ensure_schema()
+    def __init__(self, path: str = "data/weights.json", version: str = "5.1.9", **kwargs) -> None:
+        # compat: accept weights_path alias
+        path = str(kwargs.get("weights_path") or path)
+        self.path = path
 
-    # ----------------------------
-    # Legacy behavior (KEEP)
-    # ----------------------------
-    def _ensure_schema(self) -> None:
-        if not isinstance(self.data, dict):
-            self.data = {}
+        now = _now_ts()
+        self.data: Dict[str, Any] = {
+            "session": {},
+            "pattern": {},
+            "structure": {},
+            "trend": {},
+            "expert_regime": {},
+            "meta": {
+                "created_at": now,
+                "updated_at": now,
+                "version": str(version),
+            },
+        }
 
-        for k in ["session", "pattern", "structure", "trend", "expert_regime"]:
-            v = self.data.get(k)
-            if not isinstance(v, dict):
-                self.data[k] = {}
+        # auto-load if exists
+        self.load(silent=True)
 
+    # ---------- compat: dict-like ----------
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(self.data)
+
+    # ---------- core ----------
+    def _key(self, expert: Optional[str], regime: Optional[str]) -> str:
+        e = str(expert or "UNKNOWN")
+        r = str(regime or "unknown")
+        return f"{e}|{r}"
+
+    def get(self, expert: Optional[str] = None, regime: Optional[str] = None, default: float = 1.0) -> float:
+        k = self._key(expert, regime)
+        xs = self.data.get("expert_regime", {})
+        if not isinstance(xs, dict):
+            return float(default)
+        return _safe_float(xs.get(k, default), float(default))
+
+    def set(self, expert: Optional[str], regime: Optional[str], value: float) -> None:
+        k = self._key(expert, regime)
+        if not isinstance(self.data.get("expert_regime"), dict):
+            self.data["expert_regime"] = {}
+        self.data["expert_regime"][k] = float(value)
+        self._touch()
+
+    def update(self, expert: Optional[str], regime: Optional[str], delta: float, *, min_v: float = 0.05, max_v: float = 10.0) -> float:
+        """
+        Stability layer (light):
+        - clamp weights to [min_v, max_v]
+        - no schema changes
+        """
+        cur = self.get(expert, regime, default=1.0)
+        nxt = float(cur) + float(delta)
+        if nxt < float(min_v):
+            nxt = float(min_v)
+        if nxt > float(max_v):
+            nxt = float(max_v)
+        self.set(expert, regime, nxt)
+        return nxt
+
+    def _touch(self) -> None:
         meta = self.data.get("meta")
         if not isinstance(meta, dict):
             meta = {}
             self.data["meta"] = meta
+        meta["updated_at"] = _now_ts()
 
-        # compat meta defaults (ADD but schema-safe)
-        meta.setdefault("created_at", time.time())
-        meta.setdefault("updated_at", time.time())
-        meta.setdefault("version", "5.1.9")
-
-    def get_bucket(self, bucket: str) -> Dict[str, float]:
-        self._ensure_schema()
-        b = self.data.get(bucket)
-        if not isinstance(b, dict):
-            b = {}
-            self.data[bucket] = b
-        return b  # type: ignore
-
-    def get(self, bucket: str, key: str, default: float = 1.0) -> float:
-        b = self.get_bucket(bucket)
-        v = b.get(key, default)
+    # ---------- IO ----------
+    def load(self, silent: bool = False) -> None:
         try:
-            return float(v)
+            if not os.path.exists(self.path):
+                return
+            with open(self.path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+
+            if isinstance(obj, dict):
+                # merge but keep schema keys
+                for k in ("session", "pattern", "structure", "trend", "expert_regime", "meta"):
+                    if k in obj:
+                        self.data[k] = obj[k]
+
+                # ensure required keys exist
+                self.data.setdefault("session", {})
+                self.data.setdefault("pattern", {})
+                self.data.setdefault("structure", {})
+                self.data.setdefault("trend", {})
+                self.data.setdefault("expert_regime", {})
+                self.data.setdefault("meta", {"created_at": _now_ts(), "updated_at": _now_ts(), "version": "5.1.9"})
         except Exception:
-            return float(default)
+            if not silent:
+                raise
 
-    def set(self, bucket: str, key: str, value: float) -> None:
-        b = self.get_bucket(bucket)
-        b[key] = float(value)
+    def save(self) -> None:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         self._touch()
-
-    def update_add(self, bucket: str, key: str, delta: float) -> float:
-        cur = self.get(bucket, key, default=1.0)
-        nxt = float(cur) + float(delta)
-        self.set(bucket, key, nxt)
-        return nxt
-
-    def keys(self, bucket: str) -> list[str]:
-        b = self.get_bucket(bucket)
-        return list(b.keys())
-
-    def _touch(self) -> None:
-        self._ensure_schema()
-        meta = self.data["meta"]
-        if isinstance(meta, dict):
-            meta["updated_at"] = time.time()
-
-    # ----------------------------
-    # I/O (KEEP) + compat safety (ADD)
-    # ----------------------------
-    def save(self, path: str) -> None:
-        self._ensure_schema()
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(self.path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
 
-    @classmethod
-    def load(cls, path: str) -> "WeightStore":
-        if not path or not os.path.exists(path):
-            return cls({})
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return cls(data if isinstance(data, dict) else {})
-        except Exception:
-            return cls({})
-
-    # Convenience for existing code (KEEP API)
-    def to_dict(self) -> Dict[str, Any]:
-        self._ensure_schema()
-        return dict(self.data)
+    # compat aliases
+    def dump(self) -> None:
+        self.save()
