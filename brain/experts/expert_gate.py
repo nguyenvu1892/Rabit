@@ -1,5 +1,4 @@
 # brain/experts/expert_gate.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,140 +7,132 @@ from typing import Any, Dict, List, Optional, Tuple
 from brain.experts.expert_base import ExpertDecision
 
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def _ensure_dict(maybe: Any) -> Dict[str, Any]:
-    return maybe if isinstance(maybe, dict) else {}
-
-
-def _coerce_decision(raw: Any, fallback_expert: str) -> ExpertDecision:
-    """
-    Compat: accept various return formats from experts:
-      - ExpertDecision
-      - dict {allow, score, risk_cfg, meta}
-      - tuple/list (allow, score, risk_cfg)
-    """
-    if isinstance(raw, ExpertDecision):
-        return raw
-
-    # dict-form
-    if isinstance(raw, dict):
-        allow = bool(raw.get("allow", False))
-        score = _safe_float(raw.get("score", 0.0), 0.0)
-        risk_cfg = _ensure_dict(raw.get("risk_cfg"))
-        meta = _ensure_dict(raw.get("meta"))
-        return ExpertDecision(
-            expert=fallback_expert,
-            allow=allow,
-            score=score,
-            risk_cfg=risk_cfg,
-            meta=meta,
-        )
-
-    # tuple/list form
-    if isinstance(raw, (tuple, list)) and len(raw) >= 2:
-        allow = bool(raw[0])
-        score = _safe_float(raw[1], 0.0)
-        risk_cfg = _ensure_dict(raw[2]) if len(raw) >= 3 else {}
-        return ExpertDecision(
-            expert=fallback_expert,
-            allow=allow,
-            score=score,
-            risk_cfg=risk_cfg,
-            meta={},
-        )
-
-    # fallback
-    return ExpertDecision(expert=fallback_expert, allow=False, score=0.0, risk_cfg={}, meta={})
-
-
 @dataclass
+class GateOutput:
+    allow: bool
+    score: float
+    risk_cfg: Dict[str, Any]
+    expert: str
+    meta: Dict[str, Any]
+
+
 class ExpertGate:
-    registry: Any
-    weight_store: Any = None
-    debug: bool = False
+    """
+    Select best expert decision from registry.
+    Returns (allow, score, risk_cfg).
+    """
 
-    def _get_all(self) -> List[Any]:
-        # compat for registry.get_all()
-        if hasattr(self.registry, "get_all"):
+    def __init__(self, registry: Any, weight_store: Optional[Any] = None, debug: bool = False):
+        self.registry = registry
+        self.weight_store = weight_store
+        self.debug = debug
+
+    def _get_experts(self) -> List[Any]:
+        xs: List[Any] = []
+        try:
+            if hasattr(self.registry, "get_all"):
+                tmp = self.registry.get_all()
+                if isinstance(tmp, list):
+                    xs = tmp
+        except Exception:
+            xs = []
+
+        # ---- COMPAT BLOCK: never allow empty registry to brick the system ----
+        # If registry is empty, we still want the pipeline to run deterministically.
+        # Try fallback import DEFAULT_EXPERTS (baseline set).
+        if not xs:
             try:
-                xs = self.registry.get_all()
-                return list(xs) if xs is not None else []
+                from brain.experts.experts_basic import DEFAULT_EXPERTS  # type: ignore
+                if isinstance(DEFAULT_EXPERTS, list) and DEFAULT_EXPERTS:
+                    xs = DEFAULT_EXPERTS
             except Exception:
-                return []
-        return []
+                xs = []
+        # ---------------------------------------------------------------------
 
-    def pick(
-        self,
-        features: Dict[str, Any],
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, float, Dict[str, Any]]:
-        """
-        Returns:
-          (allow, score, risk_cfg)
-        """
-        ctx = context or {}
-        regime = ctx.get("regime") or ctx.get("market_regime") or ctx.get("state") or "unknown"
-        regime_conf = _safe_float(ctx.get("regime_conf") or ctx.get("confidence") or 0.0, 0.0)
+        return xs
 
-        experts = self._get_all()
+    def decide(self, features: Dict[str, Any]) -> GateOutput:
+        experts = self._get_experts()
+
         best: Optional[ExpertDecision] = None
+        best_raw: float = -1e18
+        best_name: str = "UNKNOWN"
+        best_meta: Dict[str, Any] = {}
 
-        for exp in experts:
-            name = getattr(exp, "name", None) or getattr(exp, "__name__", None) or exp.__class__.__name__
+        for e in experts:
             try:
-                raw = exp.decide(features, ctx) if hasattr(exp, "decide") else exp(features, ctx)
+                # ---- COMPAT: support both decide() and evaluate() on expert ----
+                if hasattr(e, "decide"):
+                    dec = e.decide(features)
+                elif hasattr(e, "evaluate"):
+                    dec = e.evaluate(features)
+                else:
+                    dec = None
+                # ----------------------------------------------------------------
+
+                d = ExpertDecision.coerce(dec)
+                name = getattr(e, "name", None) or getattr(d, "expert", None) or "UNKNOWN"
+                d.expert = str(name)
+
+                raw_score = float(getattr(d, "score", 0.0) or 0.0)
+
+                # apply weight if available
+                w = 1.0
+                try:
+                    if self.weight_store is not None:
+                        # weight key convention: EXPERT|REGIME
+                        regime = (
+                            features.get("market_regime")
+                            or features.get("regime")
+                            or features.get("state")
+                            or "unknown"
+                        )
+                        key = f"{d.expert}|{regime}"
+                        w = float(self.weight_store.get(key, 1.0))
+                except Exception:
+                    w = 1.0
+
+                weighted = raw_score * w
+
+                if weighted > best_raw:
+                    best_raw = weighted
+                    best = d
+                    best_name = d.expert
+                    best_meta = d.meta if isinstance(d.meta, dict) else {}
             except Exception:
-                raw = None
-
-            dec = _coerce_decision(raw, fallback_expert=str(name))
-
-            # ensure expert name is set
-            if not getattr(dec, "expert", None):
-                dec.expert = str(name)
-
-            # choose by score
-            if best is None or float(dec.score) > float(best.score):
-                best = dec
+                continue
 
         if best is None:
-            # hard fallback
-            best = ExpertDecision(expert="FALLBACK", allow=False, score=0.0, risk_cfg={}, meta={})
+            # keep deterministic fallback
+            best = ExpertDecision(allow=False, score=0.0, expert="UNKNOWN", meta={})
 
-        # weight by expert|regime if available
-        w = 1.0
-        if self.weight_store is not None and hasattr(self.weight_store, "get_expert_regime_weight"):
-            try:
-                w = float(self.weight_store.get_expert_regime_weight(best.expert, str(regime)))
-            except Exception:
-                w = 1.0
+        allow = bool(best.allow)
+        score = float(best_raw if best_raw > -1e18 else (best.score or 0.0))
 
-        raw_score = _safe_float(best.score, 0.0)
-        score = raw_score * w
+        # risk_cfg contract: dict
+        risk_cfg: Dict[str, Any] = {}
+        try:
+            if isinstance(getattr(best, "risk_cfg", None), dict):
+                risk_cfg.update(best.risk_cfg)
+        except Exception:
+            pass
 
-        # attach meta (schema-safe)
-        meta = _ensure_dict(getattr(best, "meta", None))
-        meta["expert"] = best.expert
-        meta["regime"] = str(regime)
-        meta["regime_conf"] = float(regime_conf)
-        meta["w"] = float(w)
-        meta["raw_score"] = float(raw_score)
+        # attach meta for downstream
+        meta: Dict[str, Any] = {}
+        meta.update(best_meta or {})
+        meta.setdefault("expert", best_name)
+        meta.setdefault("raw_score", float(getattr(best, "score", 0.0) or 0.0))
+        meta.setdefault("weighted_score", float(score))
 
-        risk_cfg = _ensure_dict(getattr(best, "risk_cfg", None))
-        risk_cfg["meta"] = meta  # keep compat: risk_cfg carries meta
+        risk_cfg.setdefault("meta", {})
+        if isinstance(risk_cfg["meta"], dict):
+            risk_cfg["meta"].update(meta)
 
-        if self.debug:
-            try:
-                print(
-                    f"[ExpertGate] best={best.expert} regime={regime} "
-                    f"allow={best.allow} raw={raw_score:.4f} w={w:.4f} score={score:.4f}"
-                )
-            except Exception:
-                pass
+        return GateOutput(allow=allow, score=score, risk_cfg=risk_cfg, expert=best_name, meta=meta)
 
-        return bool(best.allow), float(score), risk_cfg
+    # ---- COMPAT BLOCK --------------------------------------------------------
+    # Older DecisionEngine called gate.evaluate(features)
+    def evaluate(self, features: Dict[str, Any]) -> Tuple[bool, float, Dict[str, Any]]:
+        out = self.decide(features)
+        return out.allow, out.score, out.risk_cfg
+    # -------------------------------------------------------------------------

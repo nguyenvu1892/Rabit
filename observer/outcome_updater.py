@@ -1,113 +1,203 @@
 # observer/outcome_updater.py
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, Optional
+import time
 
-
+# ----------------------------
+# Legacy helpers (KEEP)
+# ----------------------------
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
-        if x is None:
-            return default
         return float(x)
     except Exception:
         return default
 
 
-def _pick_regime(risk_cfg: Any) -> str:
-    if not isinstance(risk_cfg, dict):
-        return "unknown"
-    r = risk_cfg.get("regime") or risk_cfg.get("market_regime") or risk_cfg.get("state")
-    return str(r) if r is not None else "unknown"
+def _ensure_dict(x: Any) -> Dict[str, Any]:
+    return x if isinstance(x, dict) else {}
 
 
-def _pick_expert(risk_cfg: Any, meta: Any) -> str:
-    # prefer explicit risk_cfg.expert, then meta.expert, then UNKNOWN
-    if isinstance(risk_cfg, dict):
-        e = risk_cfg.get("expert") or (risk_cfg.get("meta", {}) or {}).get("expert")
-        if e:
-            return str(e)
-    if isinstance(meta, dict):
-        e2 = meta.get("expert")
-        if e2:
-            return str(e2)
-    return "UNKNOWN"
-
-
-@dataclass
+# ----------------------------
+# OutcomeUpdater
+# ----------------------------
 class OutcomeUpdater:
     """
-    Compat-first OutcomeUpdater:
-    - Accepts extra kwargs without crashing (autosave, learner, weights_path...)
-    - Keeps API: process_outcome(snapshot, outcome)
+    KEEP existing behavior:
+      - process_outcome(snapshot, outcome) updates weight_store
+      - can write journal lines if journal_path provided
+
+    COMPAT (ADD):
+      - accept unexpected kwargs: learner, autosave, weights_path, save_every...
+      - autosave kw from tools/shadow_run.py no longer crashes
     """
-    weight_store: Any
-    journal_path: str = "data/journal_train.jsonl"
-    autosave: bool = True
 
-    # NOTE: dataclass would generate __init__ without **kwargs.
-    # We add compat __init__ manually to avoid unexpected keyword errors.
-    def __init__(self, weight_store: Any, journal_path: str = "data/journal_train.jsonl", autosave: bool = True, **kwargs) -> None:
+    def __init__(
+        self,
+        weight_store,
+        journal_path: Optional[str] = None,
+        # legacy / compat params:
+        weights_path: Optional[str] = None,
+        autosave: bool = False,
+        save_every: int = 1,
+        learner=None,
+        **kwargs,
+    ) -> None:
         self.weight_store = weight_store
+        self.journal_path = journal_path
+        self.weights_path = weights_path
+        self.autosave = bool(autosave)
+        self.save_every = max(1, int(save_every))
+        self.learner = learner  # kept for forward-compat (not required)
 
-        # compat aliases
-        self.journal_path = str(kwargs.get("journal") or kwargs.get("journal_path") or journal_path)
-        self.autosave = bool(kwargs.get("autosave", autosave))
+        self._n = 0
+        self._last_save_ts = 0.0
 
-        # accept but ignore (compat): learner, weights_path, etc.
-        # (do NOT remove: keeps shadow_run older/newer versions working)
-        self._compat_extra = dict(kwargs)
+        # COMPAT: accept alternative names without breaking callers
+        # (do NOT change schema; only map)
+        if "weights" in kwargs and self.weights_path is None:
+            try:
+                self.weights_path = str(kwargs["weights"])
+            except Exception:
+                pass
+        if "journal" in kwargs and self.journal_path is None:
+            try:
+                self.journal_path = str(kwargs["journal"])
+            except Exception:
+                pass
+        if "autosave_every" in kwargs:
+            try:
+                self.save_every = max(1, int(kwargs["autosave_every"]))
+            except Exception:
+                pass
 
+    # ----------------------------
+    # Extraction helpers (KEEP + improve robustness)
+    # ----------------------------
+    def _extract_expert(self, snapshot: Dict[str, Any]) -> str:
+        risk_cfg = _ensure_dict(snapshot.get("risk_cfg"))
+        e = risk_cfg.get("expert")
+        if isinstance(e, str) and e.strip():
+            return e.strip()
+        meta = _ensure_dict(risk_cfg.get("meta"))
+        e2 = meta.get("expert") or meta.get("expert_name")
+        if isinstance(e2, str) and e2.strip():
+            return e2.strip()
+        return "UNKNOWN"
+
+    def _extract_regime(self, snapshot: Dict[str, Any]) -> str:
+        risk_cfg = _ensure_dict(snapshot.get("risk_cfg"))
+        r = risk_cfg.get("regime") or risk_cfg.get("market_regime") or risk_cfg.get("state")
+        if isinstance(r, str) and r.strip():
+            return r.strip()
+        meta = _ensure_dict(risk_cfg.get("meta"))
+        r2 = meta.get("regime") or meta.get("market_regime") or meta.get("state")
+        if isinstance(r2, str) and r2.strip():
+            return r2.strip()
+        return "unknown"
+
+    def _extract_confidence(self, snapshot: Dict[str, Any]) -> float:
+        risk_cfg = _ensure_dict(snapshot.get("risk_cfg"))
+        c = risk_cfg.get("regime_conf") or risk_cfg.get("confidence")
+        if c is None:
+            meta = _ensure_dict(risk_cfg.get("meta"))
+            c = meta.get("regime_conf") or meta.get("confidence") or meta.get("score01")
+        return _safe_float(c, 0.0)
+
+    # ----------------------------
+    # Journal writing (KEEP, best-effort)
+    # ----------------------------
+    def _append_journal(self, row: Dict[str, Any]) -> None:
+        if not self.journal_path:
+            return
+        try:
+            import json
+
+            with open(self.journal_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    # ----------------------------
+    # Weight saving (KEEP + compat)
+    # ----------------------------
+    def _maybe_save(self) -> None:
+        if not self.weights_path:
+            return
+        # autosave: every save_every outcomes OR if autosave True (still respects save_every)
+        if (self._n % self.save_every) != 0:
+            return
+        try:
+            # avoid overly frequent saves in tight loops
+            now = time.time()
+            if now - self._last_save_ts < 0.2:
+                return
+            self._last_save_ts = now
+            self.weight_store.save(self.weights_path)
+        except Exception:
+            pass
+
+    # ----------------------------
+    # Core API (KEEP)
+    # ----------------------------
     def process_outcome(self, snapshot: Dict[str, Any], outcome: Dict[str, Any]) -> None:
         """
-        Update weight_store by reward * confidence (very light stability).
-        We DO NOT change schemas; only consume existing fields.
+        snapshot schema: {"step":..., "features":..., "risk_cfg":..., "meta":...}
+        outcome schema: {"win": bool, "pnl": float, ...}
+
+        Updates weight_store with delta ~ reward * confidence.
         """
-        features = snapshot.get("features") or {}
-        risk_cfg = snapshot.get("risk_cfg") or {}
-        meta = snapshot.get("meta") or {}
+        self._n += 1
+        snapshot = _ensure_dict(snapshot)
+        outcome = _ensure_dict(outcome)
 
-        expert = _pick_expert(risk_cfg, meta)
-        regime = _pick_regime(risk_cfg)
+        expert = self._extract_expert(snapshot)
+        regime = self._extract_regime(snapshot)
+        conf = self._extract_confidence(snapshot)
 
-        win = bool(outcome.get("win", False))
-        pnl = _safe_float(outcome.get("pnl"), 0.0)
+        pnl = _safe_float(outcome.get("pnl", 0.0), 0.0)
+        win = bool(outcome.get("win", pnl > 0))
 
-        # reward shaping (simple, stable):
-        # - win => +1, loss => -1
-        # - scaled by small factor + optional confidence
-        reward = 1.0 if win else -1.0
+        # Legacy-like reward: use pnl directly (already signed)
+        reward = pnl
 
-        conf = _safe_float(risk_cfg.get("regime_conf") or risk_cfg.get("confidence"), 0.0)
-        conf = max(0.0, min(1.0, conf if conf > 0 else 1.0))  # default 1.0 if missing
+        # COMPAT stability layer: clamp conf into [0..1] softly (without assuming score range)
+        if conf < 0.0:
+            conf = 0.0
+        if conf > 1.0 and conf < 10.0:
+            # if conf is like "score raw", shrink (still monotonic)
+            conf = min(1.0, conf / 10.0)
+        if conf > 1.0:
+            conf = 1.0
 
-        # delta small to avoid exploding weights
-        delta = 0.02 * reward * conf
+        delta = reward * conf
 
-        if hasattr(self.weight_store, "update"):
-            try:
-                self.weight_store.update(expert, regime, delta)
-            except Exception:
-                # fallback: set/get style
-                try:
-                    cur = 1.0
-                    if hasattr(self.weight_store, "get"):
-                        cur = float(self.weight_store.get(expert, regime, 1.0))
-                    if hasattr(self.weight_store, "set"):
-                        self.weight_store.set(expert, regime, cur + delta)
-                except Exception:
-                    pass
+        # update store (KEEP method name expected by current weight_store.py)
+        try:
+            if hasattr(self.weight_store, "update_expert_regime"):
+                self.weight_store.update_expert_regime(expert=expert, regime=regime, delta=delta)
+            else:
+                # last resort: try generic update(key, delta)
+                key = f"{expert}|{regime}"
+                if hasattr(self.weight_store, "update"):
+                    self.weight_store.update(key, delta)  # type: ignore
+        except Exception:
+            pass
 
-        if self.autosave and hasattr(self.weight_store, "save"):
-            try:
-                self.weight_store.save()
-            except Exception:
-                pass
+        # journal row (best effort)
+        self._append_journal(
+            {
+                "t": time.time(),
+                "expert": expert,
+                "regime": regime,
+                "conf": conf,
+                "reward": reward,
+                "delta": delta,
+                "win": win,
+                "pnl": pnl,
+            }
+        )
 
-        # journal is optional; keep compat (do not enforce)
-        j = self._compat_extra.get("journal_obj")
-        if j is not None and hasattr(j, "log_outcome"):
-            try:
-                j.log_outcome(step=snapshot.get("step"), outcome=outcome)
-            except Exception:
-                pass
+        # save weights
+        if self.autosave or self.weights_path:
+            self._maybe_save()
