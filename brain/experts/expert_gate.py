@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Iterable
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     from brain.experts.expert_base import ExpertDecision, ExpertBase
@@ -262,6 +262,7 @@ class ExpertGate:
         # Then set allow=True always so system doesn't become deny=100%.
         best: Optional[ExpertDecision] = None
         best_score = float("-inf")
+
         for d in decisions:
             s = _safe_float(getattr(d, "score", 0.0), 0.0)
             if s > best_score:
