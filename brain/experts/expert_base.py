@@ -5,64 +5,118 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 
+# ============================================================
+# Legacy / compat-safe helpers (DO NOT REMOVE)
+# ============================================================
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+# ============================================================
+# LEGACY DATACLASSES (kept for backward compatibility)
+# - We keep these around to avoid breaking older imports.
+# ============================================================
+
+@dataclass
+class LegacyExpertDecision:
+    """
+    Legacy schema that some modules may still import/expect.
+    """
+    expert: str = "UNKNOWN"
+    allow: bool = True
+    score: float = 0.0
+    action: str = "hold"
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+# ============================================================
+# CURRENT ExpertDecision (with compat __init__)
+# ============================================================
+
 @dataclass
 class ExpertDecision:
     """
-    Canonical decision object used across ExpertGate/DecisionEngine.
+    Canonical decision object across the project.
 
-    NOTE:
-    - Keep fields stable (API/schema).
-    - COMPAT: accept legacy callers that pass risk_cfg=... into ExpertDecision().
+    Compat rules:
+    - accept risk_cfg=... (old name) and store into meta["risk_cfg"]
+    - accept risk=... or risk_config=... as aliases (store into meta)
+    - accept any extra kwargs without crashing (store into meta["_extra"])
     """
-    allow: bool = False
-    score: float = 0.0
     expert: str = "UNKNOWN"
+    allow: bool = True
+    score: float = 0.0
+    action: str = "hold"
     meta: Dict[str, Any] = field(default_factory=dict)
 
-    # ---- COMPAT BLOCK (do not remove old fields) -----------------------------
-    # Some older code paths constructed ExpertDecision(..., risk_cfg={...}).
-    # We keep schema backward-compatible by adding an optional field.
-    risk_cfg: Dict[str, Any] = field(default_factory=dict)
-    # -------------------------------------------------------------------------
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Support positional dataclass-like init (rare)
+        if args:
+            # Fallback: map positional in the canonical order
+            # (expert, allow, score, action, meta)
+            expert = args[0] if len(args) > 0 else kwargs.pop("expert", "UNKNOWN")
+            allow = args[1] if len(args) > 1 else kwargs.pop("allow", True)
+            score = args[2] if len(args) > 2 else kwargs.pop("score", 0.0)
+            action = args[3] if len(args) > 3 else kwargs.pop("action", "hold")
+            meta = args[4] if len(args) > 4 else kwargs.pop("meta", None)
+            kwargs.setdefault("expert", expert)
+            kwargs.setdefault("allow", allow)
+            kwargs.setdefault("score", score)
+            kwargs.setdefault("action", action)
+            if meta is not None:
+                kwargs.setdefault("meta", meta)
 
-    @staticmethod
-    def coerce(obj: Any) -> "ExpertDecision":
-        """
-        Convert a dict/ExpertDecision/None into ExpertDecision safely.
-        """
-        if isinstance(obj, ExpertDecision):
-            return obj
-        if isinstance(obj, dict):
-            d = obj
-            return ExpertDecision(
-                allow=bool(d.get("allow", False)),
-                score=float(d.get("score", 0.0) or 0.0),
-                expert=str(d.get("expert", "UNKNOWN") or "UNKNOWN"),
-                meta=d.get("meta") if isinstance(d.get("meta"), dict) else {},
-                risk_cfg=d.get("risk_cfg") if isinstance(d.get("risk_cfg"), dict) else {},
-            )
-        return ExpertDecision()
+        # ---- Known fields ----
+        expert = kwargs.pop("expert", "UNKNOWN")
+        allow = kwargs.pop("allow", True)
+        score = kwargs.pop("score", 0.0)
+        action = kwargs.pop("action", "hold")
+        meta = kwargs.pop("meta", None)
+        if not isinstance(meta, dict):
+            meta = {} if meta is None else {"_meta": meta}
+
+        # ---- Compat aliases ----
+        # Old naming: risk_cfg
+        if "risk_cfg" in kwargs:
+            meta["risk_cfg"] = kwargs.pop("risk_cfg")
+        if "risk" in kwargs:
+            meta["risk"] = kwargs.pop("risk")
+        if "risk_config" in kwargs:
+            meta["risk_config"] = kwargs.pop("risk_config")
+
+        # Keep any extra fields so we don't lose info
+        if kwargs:
+            meta.setdefault("_extra", {})
+            try:
+                meta["_extra"].update(kwargs)
+            except Exception:
+                meta["_extra"] = {"_raw": str(kwargs)}
+
+        # Assign
+        self.expert = str(expert) if expert is not None else "UNKNOWN"
+        self.allow = bool(allow)
+        self.score = _safe_float(score, 0.0)
+        self.action = str(action) if action is not None else "hold"
+        self.meta = meta
 
 
-class BaseExpert:
-    """
-    Base class for experts.
-    """
+# ============================================================
+# Expert base class (stable)
+# ============================================================
 
+class ExpertBase:
     name: str = "BASE"
 
-    def decide(self, features: Dict[str, Any]) -> ExpertDecision:
-        """
-        Return ExpertDecision. Override in child classes.
-        """
-        return ExpertDecision(allow=False, score=0.0, expert=getattr(self, "name", "BASE"), meta={})
-
-    # ---- COMPAT BLOCK --------------------------------------------------------
-    # Some code used evaluate() naming.
-    def evaluate(self, features: Dict[str, Any]) -> ExpertDecision:
-        return self.decide(features)
-    # -------------------------------------------------------------------------
+    def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> ExpertDecision:
+        # Default safe: allow True with tiny score (baseline-like)
+        return ExpertDecision(expert=self.name, allow=True, score=0.0001, action="hold", meta={"reason": "expert_base_default"})
 
 
-# Alias for older imports
-ExpertBase = BaseExpert
+# Backward-compatible alias names (some modules import these)
+BaseExpert = ExpertBase

@@ -4,135 +4,193 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from brain.experts.expert_base import ExpertDecision
+try:
+    from brain.experts.expert_base import ExpertDecision
+except Exception:
+    # Ultra fallback: never crash import
+    from dataclasses import dataclass, field
+    from typing import Any, Dict
+
+    @dataclass
+    class ExpertDecision:  # type: ignore
+        expert: str = "UNKNOWN"
+        allow: bool = True
+        score: float = 0.0
+        action: str = "hold"
+        meta: Dict[str, Any] = field(default_factory=dict)
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
 @dataclass
-class GateOutput:
-    allow: bool
-    score: float
-    risk_cfg: Dict[str, Any]
-    expert: str
-    meta: Dict[str, Any]
+class GateOut:
+    """
+    Internal helper: output of gate selection.
+    """
+    best: ExpertDecision
+    debug: Dict[str, Any]
 
 
 class ExpertGate:
     """
-    Select best expert decision from registry.
-    Returns (allow, score, risk_cfg).
+    Gate evaluates multiple experts and chooses the best.
+
+    COMPAT:
+    - expose evaluate(...) and evaluate_trade(...) and decide(...)
+    - never crash if registry shape differs
+    - never return empty: if no experts, return a baseline allow=True decision
     """
 
-    def __init__(self, registry: Any, weight_store: Optional[Any] = None, debug: bool = False):
+    def __init__(self, registry: Any, weight_store: Optional[Any] = None, debug: bool = False, **kwargs: Any) -> None:
         self.registry = registry
         self.weight_store = weight_store
-        self.debug = debug
+        self.debug = bool(debug)
+        # Accept/ignore compat kwargs so older constructors don't crash
+        self._compat_kwargs = dict(kwargs)
 
+    # ----------------------------
+    # Registry helpers (compat)
+    # ----------------------------
     def _get_experts(self) -> List[Any]:
-        xs: List[Any] = []
-        try:
-            if hasattr(self.registry, "get_all"):
-                tmp = self.registry.get_all()
-                if isinstance(tmp, list):
-                    xs = tmp
-        except Exception:
-            xs = []
+        r = self.registry
+        if r is None:
+            return []
 
-        # ---- COMPAT BLOCK: never allow empty registry to brick the system ----
-        # If registry is empty, we still want the pipeline to run deterministically.
-        # Try fallback import DEFAULT_EXPERTS (baseline set).
-        if not xs:
+        # Common patterns
+        if hasattr(r, "get_all"):
             try:
-                from brain.experts.experts_basic import DEFAULT_EXPERTS  # type: ignore
-                if isinstance(DEFAULT_EXPERTS, list) and DEFAULT_EXPERTS:
-                    xs = DEFAULT_EXPERTS
+                xs = r.get_all()
+                return list(xs) if xs is not None else []
             except Exception:
-                xs = []
-        # ---------------------------------------------------------------------
+                pass
 
-        return xs
+        if hasattr(r, "all"):
+            try:
+                xs = r.all()
+                return list(xs) if xs is not None else []
+            except Exception:
+                pass
 
-    def decide(self, features: Dict[str, Any]) -> GateOutput:
+        if hasattr(r, "_experts"):
+            try:
+                xs = getattr(r, "_experts")
+                return list(xs) if xs is not None else []
+            except Exception:
+                pass
+
+        return []
+
+    def _baseline(self) -> ExpertDecision:
+        return ExpertDecision(expert="BASELINE", allow=True, score=0.0001, action="hold", meta={"reason": "gate_baseline"})
+
+    # ----------------------------
+    # Main evaluation
+    # ----------------------------
+    def evaluate_trade(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> ExpertDecision:
+        context = context or {}
         experts = self._get_experts()
 
+        if not experts:
+            # never deny 100% due to empty registry
+            d = self._baseline()
+            d.meta["context"] = context
+            return d
+
         best: Optional[ExpertDecision] = None
-        best_raw: float = -1e18
-        best_name: str = "UNKNOWN"
-        best_meta: Dict[str, Any] = {}
+        best_weighted = -1e18
+        dbg_rows: List[Dict[str, Any]] = []
 
         for e in experts:
+            name = getattr(e, "name", getattr(e, "__class__", type(e)).__name__)
             try:
-                # ---- COMPAT: support both decide() and evaluate() on expert ----
-                if hasattr(e, "decide"):
-                    dec = e.decide(features)
-                elif hasattr(e, "evaluate"):
-                    dec = e.evaluate(features)
-                else:
-                    dec = None
-                # ----------------------------------------------------------------
-
-                d = ExpertDecision.coerce(dec)
-                name = getattr(e, "name", None) or getattr(d, "expert", None) or "UNKNOWN"
-                d.expert = str(name)
-
-                raw_score = float(getattr(d, "score", 0.0) or 0.0)
-
-                # apply weight if available
-                w = 1.0
+                # Some experts use decide(features, context), some decide(features)
                 try:
-                    if self.weight_store is not None:
-                        # weight key convention: EXPERT|REGIME
-                        regime = (
-                            features.get("market_regime")
-                            or features.get("regime")
-                            or features.get("state")
-                            or "unknown"
-                        )
-                        key = f"{d.expert}|{regime}"
-                        w = float(self.weight_store.get(key, 1.0))
+                    out = e.decide(features, context=context)
+                except TypeError:
+                    out = e.decide(features)
+            except Exception as ex:
+                out = ExpertDecision(expert=str(name), allow=False, score=0.0, action="hold", meta={"error": str(ex)})
+
+            # Normalize output into ExpertDecision
+            if not isinstance(out, ExpertDecision):
+                # try to coerce dict-like
+                if isinstance(out, dict):
+                    out = ExpertDecision(**out)
+                else:
+                    out = ExpertDecision(expert=str(name), allow=False, score=0.0, action="hold", meta={"raw": str(out)})
+
+            # Ensure expert name
+            if not out.expert or out.expert == "UNKNOWN":
+                out.expert = str(name)
+
+            raw = _safe_float(getattr(out, "score", 0.0), 0.0)
+
+            # weight lookup (optional)
+            w = 1.0
+            if self.weight_store is not None:
+                try:
+                    # weight_store might expose get(key) or get_weight(expert, regime)
+                    regime = context.get("regime") or context.get("market_regime") or "unknown"
+                    key = f"{out.expert}|{regime}"
+                    if hasattr(self.weight_store, "get"):
+                        w = _safe_float(self.weight_store.get("expert_regime", key, default=1.0), 1.0)
+                    elif hasattr(self.weight_store, "get_weight"):
+                        w = _safe_float(self.weight_store.get_weight(out.expert, regime), 1.0)
                 except Exception:
                     w = 1.0
 
-                weighted = raw_score * w
+            weighted = raw * w
 
-                if weighted > best_raw:
-                    best_raw = weighted
-                    best = d
-                    best_name = d.expert
-                    best_meta = d.meta if isinstance(d.meta, dict) else {}
-            except Exception:
-                continue
+            if self.debug:
+                dbg_rows.append(
+                    {
+                        "expert": out.expert,
+                        "allow": bool(out.allow),
+                        "raw_score": raw,
+                        "weight": w,
+                        "weighted": weighted,
+                    }
+                )
+
+            # Selection policy:
+            # - Primary: higher weighted score
+            # - Secondary: prefer allow=True if tie-ish
+            if best is None:
+                best, best_weighted = out, weighted
+            else:
+                if weighted > best_weighted + 1e-12:
+                    best, best_weighted = out, weighted
+                elif abs(weighted - best_weighted) <= 1e-12:
+                    # tie: prefer allow=True
+                    if bool(out.allow) and not bool(best.allow):
+                        best, best_weighted = out, weighted
 
         if best is None:
-            # keep deterministic fallback
-            best = ExpertDecision(allow=False, score=0.0, expert="UNKNOWN", meta={})
+            best = self._baseline()
 
-        allow = bool(best.allow)
-        score = float(best_raw if best_raw > -1e18 else (best.score or 0.0))
+        # Attach debug meta
+        best.meta = best.meta or {}
+        best.meta.setdefault("context", context)
+        if self.debug:
+            best.meta["gate_debug"] = dbg_rows
+            best.meta["gate_best_weighted"] = best_weighted
 
-        # risk_cfg contract: dict
-        risk_cfg: Dict[str, Any] = {}
-        try:
-            if isinstance(getattr(best, "risk_cfg", None), dict):
-                risk_cfg.update(best.risk_cfg)
-        except Exception:
-            pass
+        return best
 
-        # attach meta for downstream
-        meta: Dict[str, Any] = {}
-        meta.update(best_meta or {})
-        meta.setdefault("expert", best_name)
-        meta.setdefault("raw_score", float(getattr(best, "score", 0.0) or 0.0))
-        meta.setdefault("weighted_score", float(score))
+    # ----------------------------
+    # COMPAT ALIASES (do not remove)
+    # ----------------------------
+    def evaluate(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> ExpertDecision:
+        # older code calls gate.evaluate(...)
+        return self.evaluate_trade(features, context=context)
 
-        risk_cfg.setdefault("meta", {})
-        if isinstance(risk_cfg["meta"], dict):
-            risk_cfg["meta"].update(meta)
-
-        return GateOutput(allow=allow, score=score, risk_cfg=risk_cfg, expert=best_name, meta=meta)
-
-    # ---- COMPAT BLOCK --------------------------------------------------------
-    # Older DecisionEngine called gate.evaluate(features)
-    def evaluate(self, features: Dict[str, Any]) -> Tuple[bool, float, Dict[str, Any]]:
-        out = self.decide(features)
-        return out.allow, out.score, out.risk_cfg
-    # -------------------------------------------------------------------------
+    def decide(self, features: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> ExpertDecision:
+        # some code calls gate.decide(...)
+        return self.evaluate_trade(features, context=context)

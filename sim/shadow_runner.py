@@ -3,16 +3,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
-import math
 import random
 import traceback
 
-from brain.features.feature_pack_v1 import FeaturePackV1
 
-# ----------------------------
-# Legacy helpers (KEEP)
-# ----------------------------
+# =========================
+# COMPAT: FeaturePackV1 (optional)
+# =========================
+try:
+    from brain.features.feature_pack_v1 import FeaturePackV1  # type: ignore
+except Exception:
+    FeaturePackV1 = None  # type: ignore
+
+
 def _regime_key(risk_cfg: Dict[str, Any]) -> str:
+    """Best-effort regime key extraction (compat across versions)."""
     if not isinstance(risk_cfg, dict):
         return "unknown"
     r = risk_cfg.get("regime") or risk_cfg.get("market_regime") or risk_cfg.get("state")
@@ -20,6 +25,7 @@ def _regime_key(risk_cfg: Dict[str, Any]) -> str:
 
 
 def _regime_conf(risk_cfg: Dict[str, Any]) -> float:
+    """Best-effort regime confidence extraction (compat across versions)."""
     if not isinstance(risk_cfg, dict):
         return 0.0
     c = risk_cfg.get("regime_conf") or risk_cfg.get("confidence") or 0.0
@@ -27,55 +33,6 @@ def _regime_conf(risk_cfg: Dict[str, Any]) -> float:
         return float(c)
     except Exception:
         return 0.0
-
-
-# ----------------------------
-# NEW compat helpers (ADD)
-# ----------------------------
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def _sigmoid(x: float) -> float:
-    # stable sigmoid
-    if x >= 0:
-        z = math.exp(-x)
-        return 1.0 / (1.0 + z)
-    z = math.exp(x)
-    return z / (1.0 + z)
-
-
-def _score_to_01(score: Any) -> float:
-    """
-    Compat layer:
-      - If score already in [0,1] -> keep.
-      - Else treat as "logit-like / unbounded score" -> map via sigmoid to (0,1).
-    """
-    s = _safe_float(score, 0.0)
-    if 0.0 <= s <= 1.0:
-        return s
-    return _sigmoid(s)
-
-
-def _extract_expert(risk_cfg: Dict[str, Any]) -> str:
-    """
-    Best-effort extract expert name for learning snapshot.
-    We DO NOT change schema; we only enrich snapshot/meta.
-    """
-    if not isinstance(risk_cfg, dict):
-        return "UNKNOWN"
-    e = risk_cfg.get("expert")
-    if isinstance(e, str) and e.strip():
-        return e.strip()
-    m = risk_cfg.get("meta")
-    if isinstance(m, dict):
-        e2 = m.get("expert") or m.get("expert_name")
-        if isinstance(e2, str) and e2.strip():
-            return e2.strip()
-    return "UNKNOWN"
 
 
 @dataclass
@@ -90,6 +47,8 @@ class ShadowStats:
     losses: int = 0
     total_pnl: float = 0.0
     forced_entries: int = 0
+
+    # per-regime aggregation (schema used by tools/shadow_run.py prints)
     regime_breakdown: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def _rb_row(self, regime: str) -> Dict[str, Any]:
@@ -129,42 +88,57 @@ class ShadowStats:
 
 class ShadowRunner:
     """
-    Compat-first ShadowRunner:
-      - __init__ accepts risk_engine (optional) to avoid 'unexpected keyword'
-      - run() accepts candles in many forms:
-            run(candles, ...) OR run(candles=...) OR run(rows=...) OR run(data=...)
+    Compat-first ShadowRunner.
+
+    Goals:
+    - DO NOT break old call sites.
+    - Accept extra kwargs (risk_engine, journal, debug...) safely.
+    - Keep the original evaluate loop + stats schema.
+
+    Supported call patterns:
+      runner = ShadowRunner(decision_engine=de, risk_engine=..., outcome_updater=..., train=..., debug=...)
+      stats  = runner.run(candles, lookback=..., max_steps=..., horizon=..., train=..., epsilon=..., epsilon_cooldown=..., journal=...)
+      stats  = runner.run(candles=..., ...)
+      stats  = runner.run(rows=..., ...)
+      stats  = runner.run(data=..., ...)
     """
 
     def __init__(
         self,
-        decision_engine,
+        decision_engine=None,
         risk_engine=None,
         outcome_updater=None,
         seed: Optional[int] = None,
         train: bool = False,
+        debug: bool = False,
         **kwargs,
     ) -> None:
-        self.de = decision_engine
-        self.risk_engine = risk_engine
+        # -------------------------
+        # COMPAT: accept both "decision_engine" and legacy "de" via kwargs
+        # -------------------------
+        if decision_engine is None:
+            decision_engine = kwargs.get("de") or kwargs.get("engine")
+
+        self.decision_engine = decision_engine
+        self.de = decision_engine  # alias (some code expects self.de)
+
+        self.risk_engine = risk_engine  # kept for forward-compat; may be unused here
         self.outcome_updater = outcome_updater
+
         self.train = bool(train)
+        self.debug = bool(debug)  # some error handlers check self.debug
+
         self.rng = random.Random(seed)
 
-    # ----------------------------
-    # Legacy sim (KEEP) + compat normalization (ADD)
-    # ----------------------------
+    # -------------------------
+    # Core sim outcome (kept simple + deterministic-ish)
+    # -------------------------
     def simulate_outcome(self, score: float) -> Dict[str, Any]:
-        """
-        Legacy expectation: score in [0..1].
-        Compat: normalize incoming score (which might be unbounded) to score01.
-        """
-        score01 = _score_to_01(score)
-        # simple sim: higher score -> higher win chance
-        # KEEP legacy formula but feed normalized score
-        p_win = max(0.05, min(0.95, 0.5 + 0.4 * (score01 - 0.5)))
+        # Higher score -> higher win chance
+        p_win = max(0.05, min(0.95, 0.5 + 0.4 * (score - 0.5)))
         win = self.rng.random() < p_win
         pnl = self.rng.uniform(0.2, 1.2) if win else -self.rng.uniform(0.2, 1.2)
-        return {"win": win, "pnl": pnl, "p_win": p_win, "score01": score01}
+        return {"win": win, "pnl": pnl}
 
     def run(
         self,
@@ -181,7 +155,17 @@ class ShadowRunner:
         journal=None,
         **kwargs,
     ) -> ShadowStats:
-        # compat input selection
+        """
+        Main loop.
+
+        IMPORTANT compat behavior:
+        - accepts journal kwarg (tools/shadow_run passes it)
+        - accepts arbitrary **kwargs to avoid 'unexpected keyword' explosions
+        """
+
+        # -------------------------
+        # COMPAT: input selection
+        # -------------------------
         if candles is None:
             candles = rows if rows is not None else data
 
@@ -189,16 +173,23 @@ class ShadowRunner:
         if candles is None:
             return stats
 
+        de = self.de or self.decision_engine
+        if de is None:
+            # No decision engine => can't evaluate anything
+            return stats
+
         train_mode = self.train if train is None else bool(train)
 
-        # push exploration config into decision engine (if supported)
-        if hasattr(self.de, "set_exploration"):
+        # -------------------------
+        # COMPAT: push exploration if supported
+        # -------------------------
+        if hasattr(de, "set_exploration"):
             try:
-                self.de.set_exploration(epsilon=float(epsilon), cooldown=int(epsilon_cooldown))
+                de.set_exploration(epsilon=float(epsilon), cooldown=int(epsilon_cooldown))
             except TypeError:
-                # legacy signature: set_exploration(float)
+                # older signature: set_exploration(float)
                 try:
-                    self.de.set_exploration(float(epsilon))
+                    de.set_exploration(float(epsilon))
                 except Exception:
                     pass
             except Exception:
@@ -210,27 +201,38 @@ class ShadowRunner:
         if end <= start:
             return stats
 
+        # -------------------------
+        # Core evaluation loop (kept)
+        # -------------------------
         for i in range(start, end):
             stats.steps += 1
-            window = candles[i - lookback : i]
-
-            # base features
-            trade_features = {"candles": window, "step": i}
-
-            # FeaturePack-v1 injection (already existing style, keep)
-            if "candles" in trade_features:
-                trade_features.update(FeaturePackV1.compute(trade_features["candles"]))
 
             try:
-                allow, score, risk_cfg = self.de.evaluate_trade(trade_features)
+                window = candles[i - lookback : i]
+
+                # Keep schema: candles + step
+                trade_features: Dict[str, Any] = {"candles": window, "step": i}
+
+                # -------------------------
+                # COMPAT: FeaturePack injection (non-breaking)
+                # -------------------------
+                if FeaturePackV1 is not None and "candles" in trade_features:
+                    try:
+                        trade_features.update(FeaturePackV1.compute(trade_features["candles"]))
+                    except Exception:
+                        pass
+
+                # DecisionEngine API (current): allow, score, risk_cfg
+                allow, score, risk_cfg = de.evaluate_trade(trade_features)
                 stats.decisions += 1
 
                 risk_cfg = risk_cfg or {}
                 forced = bool(risk_cfg.get("forced", False))
+
                 regime = _regime_key(risk_cfg)
                 conf = _regime_conf(risk_cfg)
-
                 row = stats._rb_row(regime)
+
                 row["decisions"] += 1
                 if conf > 0:
                     row["conf_sum"] += float(conf)
@@ -246,13 +248,13 @@ class ShadowRunner:
                     stats.deny += 1
                     row["deny"] += 1
 
-                # Journal decision (KEEP)
+                # journal decision (optional)
                 if journal is not None:
                     try:
                         journal.log_decision(
                             step=i,
                             allow=bool(allow),
-                            score=float(_safe_float(score, 0.0)),
+                            score=float(score),
                             risk=risk_cfg,
                             forced=forced,
                             payload={"candles_len": len(window)},
@@ -260,10 +262,10 @@ class ShadowRunner:
                     except Exception:
                         pass
 
-                # training outcome
+                # training outcome only on allowed trades
                 if train_mode and bool(allow):
-                    # simulator expects score01 -> handled in simulate_outcome
-                    outcome = self.simulate_outcome(_safe_float(score, 0.0))
+                    outcome = self.simulate_outcome(float(score))
+
                     stats.outcomes += 1
                     row["outcomes"] += 1
 
@@ -278,34 +280,25 @@ class ShadowRunner:
                     stats.total_pnl += pnl
                     row["pnl"] += pnl
 
-                    # ----------------------------
-                    # COMPAT snapshot enrichment (ADD, schema-safe)
-                    # ----------------------------
-                    meta = (risk_cfg.get("meta", {}) or {})
-                    if not isinstance(meta, dict):
-                        meta = {}
-
-                    expert = _extract_expert(risk_cfg)
-
-                    meta.setdefault("expert", expert)
-                    meta.setdefault("regime", regime)
-                    meta.setdefault("regime_conf", conf)
-                    meta.setdefault("score_raw", _safe_float(score, 0.0))
-                    meta.setdefault("score01", _score_to_01(score))
-
                     snapshot = {
                         "step": i,
                         "features": trade_features,
                         "risk_cfg": risk_cfg,
-                        "meta": meta,
+                        "meta": (risk_cfg.get("meta", {}) or {}),
                     }
 
+                    # outcome updater hook (optional)
                     if self.outcome_updater is not None:
                         try:
-                            self.outcome_updater.process_outcome(snapshot, outcome)
+                            # prefer process_outcome if present
+                            if hasattr(self.outcome_updater, "process_outcome"):
+                                self.outcome_updater.process_outcome(snapshot, outcome)
+                            elif hasattr(self.outcome_updater, "on_outcome"):
+                                self.outcome_updater.on_outcome(snapshot, outcome)
                         except Exception:
                             pass
 
+                    # journal outcome (optional)
                     if journal is not None:
                         try:
                             journal.log_outcome(step=i, outcome=outcome)
@@ -316,11 +309,12 @@ class ShadowRunner:
                 stats.errors += 1
                 try:
                     risk_cfg_local = locals().get("risk_cfg") or {}
-                    regime_local = _regime_key(risk_cfg_local)
-                    stats._rb_row(regime_local)["errors"] += 1
+                    regime = _regime_key(risk_cfg_local)
+                    stats._rb_row(regime)["errors"] += 1
                 except Exception:
                     pass
 
+                # Print only first few errors to keep console readable
                 if stats.errors <= 3:
                     print("[ShadowRunner] FIRST ERROR:", repr(e))
                     traceback.print_exc()
